@@ -122,6 +122,32 @@ def test_review_required_dependency_kind_is_kept_sticky(kanban_home: Path) -> No
         assert kb.get_task(conn, tid).status == "blocked"
 
 
+def test_review_required_rework_does_not_trip_generic_block_loop(kanban_home: Path) -> None:
+    """A second independent-review handoff is normal review-loop progress."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review rework")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: reviewer task t_round_one",
+            kind="dependency",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        assert kb.unblock_task(conn, tid)
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: reviewer task t_round_two",
+            kind="dependency",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_recurrences == 0
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------

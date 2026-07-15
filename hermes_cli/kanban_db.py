@@ -4847,7 +4847,8 @@ def block_task(
     # through ``dependency`` without an actual parent link drops it into
     # ``todo`` and lets recompute_ready() prematurely re-dispatch it.
     # Keep it sticky until an explicit structured review verdict releases it.
-    if kind == "dependency" and (reason or "").strip().lower().startswith("review-required:"):
+    is_review_required = (reason or "").strip().lower().startswith("review-required:")
+    if kind == "dependency" and is_review_required:
         kind = None
     routed_to = "blocked"
     recurrences = 0
@@ -4918,8 +4919,15 @@ def block_task(
         # the work pool), so a stored block_kind that matches the incoming kind
         # means: blocked → unblocked → about-to-re-block for the same cause.
         # An un-typed (None) block compares as "same" to a prior un-typed block.
-        same_cause = prev_kind == kind
-        recurrences = prev_recurrences + 1 if same_cause else 1
+        # Review rework is an intentional finite lifecycle, governed by the
+        # review-loop verdict/round policy.  It is not the generic
+        # unblock→re-block pathology this circuit breaker detects.  Counting
+        # it here would route a valid second review to triage and prevent the
+        # reviewer verdict from releasing the target.
+        same_cause = False if is_review_required else prev_kind == kind
+        recurrences = 0 if is_review_required else (
+            prev_recurrences + 1 if same_cause else 1
+        )
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
             # Loop detected — stop letting the unblocker spin this task. Route
