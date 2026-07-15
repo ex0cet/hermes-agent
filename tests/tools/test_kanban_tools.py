@@ -57,6 +57,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_request_resolution",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -137,7 +138,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
         "kanban_comment", "kanban_create", "kanban_link",
-        "kanban_unblock",
+        "kanban_unblock", "kanban_request_resolution",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -1134,6 +1135,169 @@ def test_create_rejects_no_title(worker_env):
 def test_create_rejects_no_assignee(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"title": "t"})).get("error")
+
+
+# ---------------------------------------------------------------------------
+# kanban_request_resolution tool
+# ---------------------------------------------------------------------------
+
+
+def test_request_resolution_happy_path(worker_env):
+    """1. Tool creates resolution task with proper link and pauses source."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    import json
+
+    # Worker task exists (worker_env fixture created it)
+    src = worker_env
+
+    out = kt._handle_request_resolution({
+        "source_task_id": src,
+        "assignee": "pm",
+        "resolution_key": "SCOPE-CONFLICT",
+        "title": "PM: decide scope",
+        "description": "Which approach should we use?",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["resolution_task_id"]
+    assert d["resolution_status"] == "ready"
+    assert d["source_status"] == "todo"
+
+    # Verify resolution task exists and is linked correctly
+    conn = kb.connect()
+    try:
+        res_task = kb.get_task(conn, d["resolution_task_id"])
+        assert res_task is not None
+        assert res_task.assignee == "pm"
+        assert res_task.status == "ready"
+
+        # Verify resolution link (kind='resolution')
+        parents = kb.parent_ids(conn, src)
+        assert d["resolution_task_id"] in parents
+        row = conn.execute(
+            "SELECT kind FROM task_links WHERE parent_id=? AND child_id=?",
+            (d["resolution_task_id"], src),
+        ).fetchone()
+        assert row["kind"] == "resolution"
+
+        # Source is in dependency wait
+        src_task = kb.get_task(conn, src)
+        assert src_task.status == "todo"
+        assert src_task.block_kind == "dependency"
+
+        # Complete resolution → source auto-promotes
+        kb.claim_task(conn, d["resolution_task_id"])
+        kb.complete_task(
+            conn, d["resolution_task_id"],
+            result="option_a",
+            summary="Go with approach A",
+        )
+        assert kb.get_task(conn, src).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_request_resolution_idempotent(worker_env):
+    """2. Same call returns same resolution task id."""
+    from tools import kanban_tools as kt
+    import json
+
+    src = worker_env
+    args = {
+        "source_task_id": src,
+        "assignee": "pm",
+        "resolution_key": "AC-CORR-05",
+        "title": "Same decision",
+    }
+    r1 = json.loads(kt._handle_request_resolution(args))
+    r2 = json.loads(kt._handle_request_resolution(args))
+    assert r1["ok"] and r2["ok"]
+    assert r1["resolution_task_id"] == r2["resolution_task_id"]
+    assert r1["resolution_status"] == r2["resolution_status"]
+
+
+def test_request_resolution_missing_required_args(worker_env):
+    """3. Missing required args return tool_error."""
+    from tools import kanban_tools as kt
+    import json
+
+    # Missing source_task_id
+    assert "required" in json.loads(
+        kt._handle_request_resolution({"assignee": "pm", "resolution_key": "K", "title": "T"})
+    ).get("error", "").lower()
+
+    # Missing assignee
+    assert "required" in json.loads(
+        kt._handle_request_resolution({"source_task_id": worker_env, "resolution_key": "K", "title": "T"})
+    ).get("error", "").lower()
+
+    # Missing resolution_key
+    assert "required" in json.loads(
+        kt._handle_request_resolution({"source_task_id": worker_env, "assignee": "pm", "title": "T"})
+    ).get("error", "").lower()
+
+    # Missing title
+    assert "required" in json.loads(
+        kt._handle_request_resolution({"source_task_id": worker_env, "assignee": "pm", "resolution_key": "K"})
+    ).get("error", "").lower()
+
+
+def test_request_resolution_invalid_source(worker_env):
+    """4. Invalid source task id returns error."""
+    from tools import kanban_tools as kt
+    import json
+
+    out = kt._handle_request_resolution({
+        "source_task_id": "t_nonexistent",
+        "assignee": "pm",
+        "resolution_key": "K",
+        "title": "T",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "not found" in d["error"] or "kanban_request_resolution" in d["error"]
+
+
+def test_request_resolution_block_tool_refers_to_new_tool(worker_env):
+    """5. kanban_block description mentions kanban_request_resolution."""
+    from tools.kanban_tools import KANBAN_BLOCK_SCHEMA
+    desc = KANBAN_BLOCK_SCHEMA.get("description", "")
+    assert "kanban_request_resolution" in desc
+
+
+def test_request_resolution_via_kanban_create_not_needed(worker_env):
+    """6. Proves the old kanban_create+kanban_block pattern is deprecated.
+
+    Calling kanban_request_resolution is a single atomic operation vs
+    the old two-step (create + block).
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    import json
+
+    src = worker_env
+    out = kt._handle_request_resolution({
+        "source_task_id": src,
+        "assignee": "reviewer",
+        "resolution_key": "ARCH-REVIEW",
+        "title": "Review architecture decision",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+
+    conn = kb.connect()
+    try:
+        # Source is already in todo — no separate block call needed
+        assert kb.get_task(conn, src).status == "todo"
+        assert kb.get_task(conn, src).block_kind == "dependency"
+
+        # No 'blocked' event or 'needs_input' block_kind
+        events = kb.list_events(conn, src)
+        block_events = [e for e in events if e.kind in ("blocked", "dependency_wait")]
+        assert any(e.kind == "dependency_wait" for e in block_events)
+    finally:
+        conn.close()
 
 
 def test_create_rejects_non_list_parents(worker_env):

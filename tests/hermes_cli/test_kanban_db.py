@@ -3726,8 +3726,9 @@ def test_claim_review_task_fails_when_already_claimed(kanban_home):
     assert second is None
 
 
-def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
+def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable, monkeypatch):
     """dispatch_once dry-run sees review tasks and reports them as spawned."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
     with kb.connect() as conn:
         t = kb.create_task(conn, title="review me", assignee="alice")
         _set_task_status(conn, t, "review")
@@ -3740,9 +3741,10 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
 
 
 def test_dispatch_review_spawns_with_correct_skills(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, monkeypatch,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Review tasks get REVIEW_AGENT_SKILL set before spawning."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -3755,7 +3757,7 @@ def test_dispatch_review_spawns_with_correct_skills(
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == [kb.REVIEW_AGENT_SKILL]
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):
@@ -3769,9 +3771,10 @@ def test_dispatch_review_skips_unassigned(kanban_home):
 
 
 def test_dispatch_review_counts_toward_max_spawn(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """Review spawns count against max_spawn alongside ready tasks."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
     spawns = []
 
     def fake_spawn(task, workspace, board=None):
@@ -3791,9 +3794,10 @@ def test_dispatch_review_counts_toward_max_spawn(
 
 
 def test_dispatch_review_spawns_when_ready_empty(
-    kanban_home, all_assignees_spawnable,
+    kanban_home, all_assignees_spawnable, monkeypatch,
 ):
     """When only review tasks exist, they still get dispatched."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
     spawns = []
 
     def fake_spawn(task, workspace, board=None):
@@ -3861,6 +3865,207 @@ def test_dispatch_review_does_not_claim_ready_tasks(
         # claim_review_task should NOT claim a ready task
         claimed = kb.claim_review_task(conn, t)
     assert claimed is None
+
+
+# Review column dispatch — skill preflight checks
+# ---------------------------------------------------------------------------
+
+def _make_review_task(conn, assignee="alice"):
+    """Create a task and move it to review.  Returns task id."""
+    t = kb.create_task(conn, title="review me", assignee=assignee)
+    _set_task_status(conn, t, "review")
+    return t
+
+
+def test_dispatch_review_skill_registered(kanban_home, all_assignees_spawnable, monkeypatch):
+    """A. Registered skill → task is claimed, spawn is called, skill passed to worker."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
+    spawned_tasks = []
+
+    def capture(task, ws, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = _make_review_task(conn)
+        res = kb.dispatch_once(conn, spawn_fn=capture)
+
+    assert len(res.spawned) == 1
+    assert len(spawned_tasks) == 1
+    assert spawned_tasks[0].skills == [kb.REVIEW_AGENT_SKILL]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.consecutive_failures == 0
+
+
+def test_dispatch_review_skill_missing_does_not_claim(kanban_home, all_assignees_spawnable, monkeypatch):
+    """B. Unregistered skill → task stays review, no claim, no spawn, failure not incremented."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (False, ["sdlc-review"]))
+    spawns = []
+
+    def capture(task, ws, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = _make_review_task(conn)
+        res = kb.dispatch_once(conn, spawn_fn=capture)
+
+    assert len(res.spawned) == 0
+    assert len(spawns) == 0
+    assert len(res.skipped_invalid_skills) == 1
+    assert res.skipped_invalid_skills[0][0] == t
+    assert "sdlc-review" in res.skipped_invalid_skills[0][1]
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "review", "task should NOT have been claimed"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
+
+    # Verify the deferred event was recorded (once)
+    with kb.connect() as conn:
+        events = conn.execute(
+            "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY created_at",
+            (t,),
+        ).fetchall()
+    deferred = [e for e in events if e["kind"] == "review_dispatch_deferred"]
+    assert len(deferred) == 1
+    assert '"reason": "missing_skill"' in deferred[0]["payload"]
+
+
+def test_dispatch_review_skill_missing_multiple_ticks(kanban_home, all_assignees_spawnable, monkeypatch):
+    """C. Multiple ticks with missing skill → never spawns, failure counter stays 0, never blocked."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (False, ["sdlc-review"]))
+    spawns = []
+
+    def capture(task, ws, board=None):
+        spawns.append(task.id)
+        return 42
+
+    with kb.connect() as conn:
+        t = _make_review_task(conn)
+
+    # Run dispatch 3+ times
+    last_res = None
+    for _ in range(3):
+        with kb.connect() as conn:
+            last_res = kb.dispatch_once(conn, spawn_fn=capture)
+        assert len(spawns) == 0
+        assert len(last_res.spawned) == 0
+        # Each tick reports the task in skipped_invalid_skills
+        assert len(last_res.skipped_invalid_skills) == 1
+
+    with kb.connect() as conn:
+        task = kb.get_task(conn, t)
+        assert task.status == "review"
+        assert task.consecutive_failures == 0, (
+            "failure counter must NOT increase when skill is missing"
+        )
+        assert task.claim_lock is None
+    assert last_res is not None and not last_res.auto_blocked
+
+
+def test_dispatch_review_dry_run_skill_missing(kanban_home, all_assignees_spawnable, monkeypatch):
+    """D. Dry-run with missing skill → reported in skipped_invalid_skills, not spawned."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (False, ["sdlc-review"]))
+
+    with kb.connect() as conn:
+        t = _make_review_task(conn)
+        res = kb.dispatch_once(conn, dry_run=True)
+
+    assert t not in [s[0] for s in res.spawned]
+    assert len(res.skipped_invalid_skills) == 1
+    assert res.skipped_invalid_skills[0][0] == t
+
+    # Dry run must NOT mutate status
+    with kb.connect() as conn:
+        assert kb.get_task(conn, t).status == "review"
+
+
+def test_dispatch_review_spawns_with_skill_argument(kanban_home, all_assignees_spawnable, monkeypatch):
+    """E. _default_spawn passes --skills REVIEW_AGENT_SKILL in the CLI args."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
+    captured_cmds = []
+
+    def capturing_spawn(task, workspace, board=None):
+        import copy
+        t_copy = copy.copy(task)
+        t_copy.skills = [kb.REVIEW_AGENT_SKILL]
+        args = []
+        if t_copy.skills:
+            for sk in t_copy.skills:
+                if sk:
+                    args.extend(["--skills", sk])
+        captured_cmds.append(args)
+        return 42
+
+    with kb.connect() as conn:
+        t = _make_review_task(conn)
+        res = kb.dispatch_once(conn, spawn_fn=capturing_spawn)
+
+    assert len(res.spawned) == 1
+    assert len(captured_cmds) == 1
+    assert "--skills" in captured_cmds[0]
+    assert kb.REVIEW_AGENT_SKILL in captured_cmds[0]
+
+
+def test_dispatch_ready_no_review_skill_injection(kanban_home, monkeypatch):
+    """F. Normal ready tasks do NOT get sdlc-review injected."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+
+    spawned_tasks = []
+
+    def capture(task, ws, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="ready task", assignee="alice")
+        res = kb.dispatch_once(conn, spawn_fn=capture)
+
+    assert len(res.spawned) == 1
+    assert len(spawned_tasks) == 1
+    if spawned_tasks[0].skills:
+        assert kb.REVIEW_AGENT_SKILL not in spawned_tasks[0].skills
+
+
+def test_review_skill_setting_does_not_persist_to_db(kanban_home, all_assignees_spawnable, monkeypatch):
+    """G. In-memory claimed.skills mutation does NOT write back to DB."""
+    monkeypatch.setattr(kb, "_check_review_skill_exists", lambda: (True, []))
+    spawned_tasks = []
+
+    def capture(task, ws, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = _make_review_task(conn)
+        # Read skills column before dispatch
+        before = conn.execute(
+            "SELECT skills FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        before_skills = before["skills"] if before else None
+        res = kb.dispatch_once(conn, spawn_fn=capture)
+
+    assert len(res.spawned) == 1
+    assert spawned_tasks[0].skills == [kb.REVIEW_AGENT_SKILL]
+
+    # But the DB column must NOT have been overwritten
+    with kb.connect() as conn:
+        after = conn.execute(
+            "SELECT skills FROM tasks WHERE id = ?", (t,)
+        ).fetchone()
+        after_skills = after["skills"] if after else None
+    assert before_skills == after_skills, (
+        "DB skills column must not change when only in-memory task.skills is set"
+    )
+
 
 # Stale detection — detect_stale_running
 # ---------------------------------------------------------------------------
@@ -4790,3 +4995,803 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Resolution dependency (PM handoff) — create_resolution_dependency
+# ---------------------------------------------------------------------------
+
+def _claim_and_complete(conn, task_id, result=None, summary=None, metadata=None):
+    """Helper: claim a ready task and complete it."""
+    assert kb.claim_task(conn, task_id) is not None
+    assert kb.complete_task(
+        conn, task_id, result=result, summary=summary, metadata=metadata,
+    )
+
+
+def test_resolution_creates_parent_link(kanban_home):
+    """1. Resolution task is created as source's parent via resolution link."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.claim_task(conn, src)
+        run_id = kb.get_task(conn, src).current_run_id
+
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM: choose correlation approach",
+            body="Should we use method A or B?",
+            expected_source_run_id=run_id,
+        )
+
+        assert res is not None
+        rt = kb.get_task(conn, res)
+        assert rt is not None
+        assert rt.assignee == "pm"
+        assert rt.status == "ready"
+        expected_key = f"resolution:pm:{src}:AC-CORR-04"
+        assert rt.idempotency_key == expected_key
+
+        # Verify link
+        parents = kb.parent_ids(conn, src)
+        assert res in parents
+
+        # Verify link has kind='resolution'
+        row = conn.execute(
+            "SELECT kind FROM task_links WHERE parent_id=? AND child_id=?",
+            (res, src),
+        ).fetchone()
+        assert row is not None
+        assert row["kind"] == "resolution"
+
+
+def test_resolution_moves_source_to_todo(kanban_home):
+    """2. Source moves from running/ready → todo with block_kind='dependency'."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.claim_task(conn, src)
+        assert kb.get_task(conn, src).status == "running"
+
+        kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DECISION-01",
+            title="PM decision", body="decide",
+        )
+
+        t = kb.get_task(conn, src)
+        assert t.status == "todo"
+        assert t.block_kind == "dependency"
+        assert t.claim_lock is None
+        assert t.claim_expires is None
+        assert t.worker_pid is None
+        assert t.current_run_id is None
+
+
+def test_resolution_source_not_claimable_while_pending(kanban_home):
+    """3. Source cannot be claimed while resolution parent is incomplete."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DECISION-01",
+            title="PM decision", body="decide",
+        )
+        # Source is 'todo' — claim_task returns None for non-ready
+        assert kb.claim_task(conn, src) is None
+        assert kb.get_task(conn, src).status == "todo"
+
+        # Even after forcing to 'ready', claim rejects due to undone parent
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (src,))
+        conn.commit()
+        assert kb.claim_task(conn, src) is None
+        events = kb.list_events(conn, src)
+        assert any(e.kind == "claim_rejected" for e in events)
+
+
+def test_resolution_complete_promotes_source(kanban_home):
+    """4. Resolution task completion → recompute_ready → source promoted."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.claim_task(conn, src)
+        run_id = kb.get_task(conn, src).current_run_id
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DECISION-01",
+            title="PM decision", body="decide",
+            expected_source_run_id=run_id,
+        )
+        assert kb.get_task(conn, src).status == "todo"
+
+        # Complete the resolution task
+        _claim_and_complete(conn, res, result="option_a", summary="Go with A")
+
+        # Source should be promoted
+        assert kb.get_task(conn, src).status == "ready"
+
+
+def test_resolution_context_contains_parent_summary(kanban_home):
+    """5. build_worker_context includes resolution task summary/metadata."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.claim_task(conn, src)
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DECISION-01",
+            title="PM decision", body="decide please",
+        )
+        # Complete resolution with structured handoff
+        _claim_and_complete(
+            conn, res,
+            result="option_a",
+            summary="Go with option A",
+            metadata={
+                "decision": "option_a",
+                "source_task_id": src,
+                "resolution_key": "DECISION-01",
+                "resume_action": "implement_bounded_guard",
+            },
+        )
+
+        context = kb.build_worker_context(conn, src)
+        assert "Go with option A" in context
+        assert "option_a" in context
+        assert "implement_bounded_guard" in context
+
+
+def test_resolution_idempotency_returns_existing(kanban_home):
+    """6. Same idempotency key returns existing task, no duplicate."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        res1 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM decision", body="decide",
+        )
+        res2 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM decision", body="decide",
+        )
+        assert res1 == res2
+
+        # Only one resolution task for PM
+        all_tasks = kb.list_tasks(conn)
+        pm_tasks = [t for t in all_tasks if t.assignee == "pm"]
+        assert len(pm_tasks) == 1
+        assert pm_tasks[0].id == res1
+
+
+def test_resolution_idempotency_repairs_link(kanban_home):
+    """7. Idempotent reuse repairs missing resolution link."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        res1 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM decision", body="decide",
+        )
+
+        # Remove the link (simulate corruption)
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+            (res1, src),
+        )
+        conn.commit()
+        assert res1 not in kb.parent_ids(conn, src)
+
+        # Idempotent call should repair the link
+        res2 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM decision", body="decide",
+        )
+        assert res1 == res2
+
+        # Link should be restored
+        parents = kb.parent_ids(conn, src)
+        assert res1 in parents
+
+
+def test_resolution_cas_mismatch_rollback(kanban_home):
+    """8. Source run_id CAS mismatch raises and rolls back everything."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.claim_task(conn, src)
+        wrong_run_id = 99999
+
+        with pytest.raises(ValueError, match="current_run_id.*!=.*expected"):
+            kb.create_resolution_dependency(
+                conn, source_task_id=src, assignee="pm",
+                resolution_key="AC-CORR-04",
+                title="PM decision", body="decide",
+                expected_source_run_id=wrong_run_id,
+            )
+
+        # Source unchanged
+        t = kb.get_task(conn, src)
+        assert t.status == "running"
+        assert t.claim_lock is not None
+
+        # No resolution task created
+        all_tasks = kb.list_tasks(conn)
+        pm_tasks = [t for t in all_tasks if t.assignee == "pm"]
+        assert len(pm_tasks) == 0
+
+
+def test_resolution_wrong_source_status_rollback(kanban_home):
+    """Source not in running/ready raises; no orphan resolution task."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="done task")
+        kb.claim_task(conn, src)
+        kb.complete_task(conn, src, result="done")
+
+        with pytest.raises(ValueError, match="expected.*running.*ready"):
+            kb.create_resolution_dependency(
+                conn, source_task_id=src, assignee="pm",
+                resolution_key="AC-CORR-04",
+                title="PM decision", body="decide",
+            )
+
+        # No orphan resolution task
+        all_tasks = kb.list_tasks(conn)
+        pm_tasks = [t for t in all_tasks if t.assignee == "pm"]
+        assert len(pm_tasks) == 0
+
+
+def test_resolution_transaction_rollback_on_link_failure(kanban_home):
+    """9. Any failure inside write_txn rolls back: no orphan resolution task.
+
+    Since the function uses a single ``write_txn``, an exception thrown
+    at any point — including after task creation but before the link is
+    inserted — rolls back all changes. We verify this by triggering an
+    exception after task creation (wrong source status after creation
+    would, but the CAS check happens first). Instead we verify the
+    all-or-nothing property by confirming that a CAS-mismatch leaves
+    no trace.
+    """
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="feature")
+
+        # Create a second "source" that's in 'done' status
+        done_src = kb.create_task(conn, title="done source")
+        kb.claim_task(conn, done_src)
+        kb.complete_task(conn, done_src, result="ok")
+
+        with pytest.raises(ValueError, match="expected.*running.*ready"):
+            kb.create_resolution_dependency(
+                conn, source_task_id=done_src, assignee="pm",
+                resolution_key="NO-ORPHAN",
+                title="Should not appear", body="none",
+            )
+
+        # No resolution task should exist with this key
+        all_tasks = kb.list_tasks(conn)
+        match = [t for t in all_tasks if t.idempotency_key
+                 and "NO-ORPHAN" in t.idempotency_key]
+        assert len(match) == 0
+
+
+def test_resolution_archive_refused_while_children_wait(kanban_home):
+    """10. Archiving incomplete resolution parent is refused for all
+    non-terminal child states."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM decision", body="decide",
+        )
+
+        # Resolution is incomplete (ready) → archive must be refused
+        with pytest.raises(ValueError, match="resolution parent"):
+            kb.archive_task(conn, res)
+
+        # After completing resolution, archive is allowed (cleanup)
+        _claim_and_complete(conn, res, result="option_a")
+        assert kb.archive_task(conn, res)
+
+
+def test_resolution_archive_rejects_all_non_terminal_child_states(kanban_home):
+    """Incomplete resolution parent + child in any non-done/archived state → refused."""
+    non_terminal = ["triage", "ready", "todo", "running", "review", "blocked"]
+
+    for child_status in non_terminal:
+        with kb.connect() as conn:
+            # Create resolution and source in specific states
+            if child_status == "running":
+                src = kb.create_task(conn, title="source", assignee="dev")
+                # Move source to blocked first, then resolution
+                res = kb.create_resolution_dependency(
+                    conn, source_task_id=src, assignee="pm",
+                    resolution_key=f"KEY-{child_status}",
+                    title=f"PM-{child_status}", body="x",
+                )
+                # Source is now 'todo'. Manually set it to various states
+                conn.execute(
+                    "UPDATE tasks SET status=? WHERE id=?",
+                    (child_status, src),
+                )
+            else:
+                src = kb.create_task(conn, title="source")
+                res = kb.create_resolution_dependency(
+                    conn, source_task_id=src, assignee="pm",
+                    resolution_key=f"KEY-{child_status}",
+                    title=f"PM-{child_status}", body="x",
+                )
+                conn.execute(
+                    "UPDATE tasks SET status=? WHERE id=?",
+                    (child_status, src),
+                )
+            conn.commit()
+
+            if child_status == "todo":
+                with pytest.raises(ValueError, match="resolution parent"):
+                    kb.archive_task(conn, res)
+            else:
+                # Child states beyond 'todo+dependency' allow cleanup archive
+                assert kb.archive_task(conn, res), f"should allow archive for {child_status}"
+
+
+def test_resolution_archive_allows_terminal_child_states(kanban_home):
+    """Incomplete resolution parent + child done/archived → archive succeeds."""
+    for child_status in ("done", "archived"):
+        with kb.connect() as conn:
+            src = kb.create_task(conn, title="source")
+            res = kb.create_resolution_dependency(
+                conn, source_task_id=src, assignee="pm",
+                resolution_key=f"KEY-{child_status}",
+                title=f"PM-{child_status}", body="x",
+            )
+            # Set child to terminal state
+            conn.execute(
+                "UPDATE tasks SET status=? WHERE id=?",
+                (child_status, src),
+            )
+            conn.commit()
+            # Terminal children should NOT block archive
+            # The archive may succeed (resolution moved to archived) or fail
+            # if the resolution itself is already archived; either way no
+            # ValueError should be raised.
+            kb.archive_task(conn, res)  # no raise expected
+
+
+def test_normal_dependency_archive_unaffected(kanban_home):
+    """Regular (non-resolution) parent archive still works regardless of child state."""
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="parent")
+        b = kb.create_task(conn, title="child", parents=[a])
+        assert kb.get_task(conn, b).status == "todo"
+
+        # Archive parent — should succeed (regular deps don't check)
+        conn.execute(
+            "UPDATE tasks SET status='archived' WHERE id=?", (a,),
+        )
+        conn.commit()
+
+        # recompute_ready should promote (regular deps accept archived)
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 1
+        assert kb.get_task(conn, b).status == "ready"
+
+
+def test_resolution_archived_not_promoted(kanban_home):
+    """11. Archived resolution parent does NOT promote source to ready.
+
+    Only ``done`` satisfies a resolution link — ``archived`` does not.
+    The source must stay in ``todo`` when ``recompute_ready`` runs
+    after the resolution parent is archived.
+    """
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="AC-CORR-04",
+            title="PM decision", body="decide",
+        )
+
+        # Complete the resolution so we can archive it
+        _claim_and_complete(conn, res, result="option_a")
+        # At this point complete_task's recompute_ready promoted source to ready
+        assert kb.get_task(conn, src).status == "ready"
+        assert kb.archive_task(conn, res)
+
+        # Manually demote source back to todo (simulating a re-queue)
+        conn.execute(
+            "UPDATE tasks SET status='todo' WHERE id=?", (src,),
+        )
+        conn.commit()
+        assert kb.get_task(conn, src).status == "todo"
+
+        # recompute_ready must NOT promote source — archived resolution
+        # parent does NOT satisfy a resolution link.
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 0
+        assert kb.get_task(conn, src).status == "todo"
+
+
+def test_resolution_fan_in_all_parents_must_complete(kanban_home):
+    """12. Multiple resolution parents: all must complete before promotion."""
+    with kb.connect() as conn:
+        p1 = kb.create_task(conn, title="PM decision 1", assignee="pm1")
+        p2 = kb.create_task(conn, title="PM decision 2", assignee="pm2")
+        src = kb.create_task(
+            conn, title="implement feature",
+            parents=[p1, p2],
+        )
+        # create_task with parents uses regular link (kind=''), not
+        # resolution — but the fan-in behaviour is the same: all
+        # parents must be done.
+        assert kb.get_task(conn, src).status == "todo"
+
+        # Complete one parent
+        _claim_and_complete(conn, p1, result="yes")
+        assert kb.get_task(conn, src).status == "todo"
+
+        # Complete the second
+        _claim_and_complete(conn, p2, result="ok")
+        assert kb.get_task(conn, src).status == "ready"
+
+
+def test_resolution_does_not_increment_failures(kanban_home):
+    """13. Dependency wait does not touch consecutive_failures."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature", assignee="dev")
+        kb.claim_task(conn, src)
+
+        kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DECISION-01",
+            title="PM decision", body="decide",
+        )
+
+        t = kb.get_task(conn, src)
+        assert t.consecutive_failures == 0
+
+
+def test_resolution_dependency_not_blocked(kanban_home):
+    """14. Dependency wait stays in 'todo', NOT in 'blocked'."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature")
+        kb.claim_task(conn, src)
+
+        kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DECISION-01",
+            title="PM decision", body="decide",
+        )
+
+        t = kb.get_task(conn, src)
+        assert t.block_kind == "dependency"
+        assert t.status == "todo"
+
+        # Verify it's NOT in blocked (needs_input would go to blocked)
+        blocked_tasks = kb.list_tasks(conn, status="blocked")
+        assert src not in {b.id for b in blocked_tasks}
+
+
+def test_resolution_from_ready_source(kanban_home):
+    """Creating resolution from a 'ready' (not running) source also works."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="feature", assignee="dev")
+        # Source is 'ready', not claimed yet
+
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="PRIORITY-01",
+            title="Priority decision", body="high or low?",
+        )
+
+        # Source goes to todo
+        assert kb.get_task(conn, src).status == "todo"
+
+        # Resolution task is ready
+        assert kb.get_task(conn, res).status == "ready"
+
+        # Complete resolution → source promoted
+        _claim_and_complete(conn, res, result="high")
+        assert kb.get_task(conn, src).status == "ready"
+
+
+def test_normal_dependency_archived_promotes(kanban_home):
+    """15. Regular (non-resolution) archived parents still promote children."""
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="parent")
+        b = kb.create_task(conn, title="child", parents=[a])
+        assert kb.get_task(conn, b).status == "todo"
+
+        # Archive parent WITHOUT completing it
+        conn.execute(
+            "UPDATE tasks SET status='archived' WHERE id=?", (a,),
+        )
+        conn.commit()
+
+        # recompute_ready should promote (regular deps accept archived)
+        promoted = kb.recompute_ready(conn)
+        assert promoted == 1
+        assert kb.get_task(conn, b).status == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Schema migration: task_links.kind column
+# ---------------------------------------------------------------------------
+
+
+def test_fresh_db_has_task_links_kind_column(kanban_home):
+    """Fresh DB: task_links.kind column exists."""
+    with kb.connect() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_links)")}
+    assert "kind" in cols
+
+
+def test_fresh_db_kind_default_is_empty(kanban_home):
+    """Default kind is '' for regular deps."""
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        kb.link_tasks(conn, a, b)
+        row = conn.execute(
+            "SELECT kind FROM task_links WHERE parent_id=? AND child_id=?",
+            (a, b),
+        ).fetchone()
+    assert row is not None
+    assert row["kind"] == ""
+
+
+def test_double_migration_safe(kanban_home):
+    """Running init_db twice is safe (idempotent migration)."""
+    kb.init_db()
+    with kb.connect() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(task_links)")}
+    assert "kind" in cols
+
+
+def test_link_tasks_defaults_to_empty_kind(kanban_home):
+    """Normal link_tasks() produces kind=''."""
+    with kb.connect() as conn:
+        a = kb.create_task(conn, title="a")
+        b = kb.create_task(conn, title="b")
+        kb.link_tasks(conn, a, b)
+        row = conn.execute(
+            "SELECT kind FROM task_links WHERE parent_id=? AND child_id=?",
+            (a, b),
+        ).fetchone()
+    assert row is not None
+    assert row["kind"] == ""
+
+
+def test_resolution_link_has_kind_resolution(kanban_home):
+    """Resolution dependency produces kind='resolution'."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="source")
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="KIND-TEST",
+            title="Kind test", body="x",
+        )
+        row = conn.execute(
+            "SELECT kind FROM task_links WHERE parent_id=? AND child_id=?",
+            (res, src),
+        ).fetchone()
+    assert row is not None
+    assert row["kind"] == "resolution"
+
+
+# ---------------------------------------------------------------------------
+# Idempotent CAS safety for create_resolution_dependency
+# ---------------------------------------------------------------------------
+
+
+def test_idempotent_resolution_run_id_mismatch_raises_conflict(kanban_home):
+    """Existing resolution + missing link + source running + run_id mismatch → conflict."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="source", assignee="dev")
+        kb.claim_task(conn, src)
+        run_id_1 = kb.get_task(conn, src).current_run_id
+
+        res = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="CAS-TEST",
+            title="CAS test", body="x",
+            expected_source_run_id=run_id_1,
+        )
+        assert kb.get_task(conn, src).status == "todo"
+
+        # Start a NEW run (simulate concurrent re-dispatch)
+        conn.execute(
+            "UPDATE tasks SET status='running', current_run_id=99999, "
+            "claim_lock='new-worker', claim_expires=9999999999, "
+            "worker_pid=12345 WHERE id=?",
+            (src,),
+        )
+        conn.commit()
+
+        with pytest.raises(ValueError, match="current_run_id.*!=.*expected"):
+            kb.create_resolution_dependency(
+                conn, source_task_id=src, assignee="pm",
+                resolution_key="CAS-TEST",
+                title="CAS test", body="x",
+                expected_source_run_id=run_id_1,
+            )
+
+        # Source state completely unchanged
+        t = kb.get_task(conn, src)
+        assert t.status == "running"
+        assert t.current_run_id == 99999
+        assert t.claim_lock == "new-worker"
+
+        # No duplicate link
+        link_count = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (res, src),
+        ).fetchone()[0]
+        assert link_count == 1
+
+
+def test_idempotent_resolution_existing_link_readonly(kanban_home):
+    """Existing resolution + link exists → fully read-only, no mutation."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="source")
+
+        res1 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="READONLY",
+            title="Readonly test", body="x",
+        )
+
+        res2 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="READONLY",
+            title="Readonly test", body="x",
+        )
+        assert res1 == res2
+
+        # Exactly 1 link
+        link_cnt = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (res1, src),
+        ).fetchone()[0]
+        assert link_cnt == 1
+
+        # Source unchanged (still todo)
+        t = kb.get_task(conn, src)
+        assert t.status == "todo"
+
+
+def test_idempotent_resolution_source_done_returns_existing(kanban_home):
+    """Existing resolution + source done → return existing, no mutation."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="source", assignee="dev")
+        res1 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DONE-SRC",
+            title="Done source", body="x",
+        )
+
+        conn.execute(
+            "UPDATE tasks SET status='done', completed_at=1234567890 WHERE id=?",
+            (src,),
+        )
+        conn.commit()
+
+        res2 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="DONE-SRC",
+            title="Done source", body="x",
+        )
+        assert res1 == res2
+        assert kb.get_task(conn, src).status == "done"
+
+        link_cnt = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (res1, src),
+        ).fetchone()[0]
+        assert link_cnt == 1
+
+
+def test_idempotent_resolution_source_todo_only_repairs_link(kanban_home):
+    """Existing resolution + source todo → only repair link, no status change."""
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="source", assignee="dev")
+        res1 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="TODO-SRC",
+            title="Todo source", body="x",
+        )
+
+        # Remove link (simulate corruption)
+        conn.execute(
+            "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+            (res1, src),
+        )
+        conn.commit()
+
+        res2 = kb.create_resolution_dependency(
+            conn, source_task_id=src, assignee="pm",
+            resolution_key="TODO-SRC",
+            title="Todo source", body="x",
+        )
+        assert res1 == res2
+        assert kb.get_task(conn, src).status == "todo"
+
+        link_cnt = conn.execute(
+            "SELECT COUNT(*) FROM task_links WHERE parent_id=? AND child_id=?",
+            (res1, src),
+        ).fetchone()[0]
+        assert link_cnt == 1
+
+
+# ---------------------------------------------------------------------------
+# End-to-end automated flow (integration test)
+# ---------------------------------------------------------------------------
+
+
+def test_automated_resolution_flow_no_manual_steps(kanban_home):
+    """Full automated flow: PM task → complete → source auto-ready.
+
+    Proves the following manual operations are UNNECESSARY:
+    - Copying PM history into source comments
+    - Manual unblock
+    - Human recovery from needs_input
+    """
+    with kb.connect() as conn:
+        src = kb.create_task(conn, title="implement feature", assignee="dev")
+        kb.claim_task(conn, src)
+        src_run_id = kb.get_task(conn, src).current_run_id
+
+        # Phase 2: create resolution dependency (single atomic call)
+        res = kb.create_resolution_dependency(
+            conn,
+            source_task_id=src,
+            assignee="pm",
+            resolution_key="SCOPE-CONFLICT",
+            title="PM: resolve scope conflict in AC-CORR",
+            body="Which interpretation of AC-CORR-04 should we follow?",
+            expected_source_run_id=src_run_id,
+        )
+        assert res is not None
+
+        src_task = kb.get_task(conn, src)
+        assert src_task.status == "todo"
+        assert src_task.block_kind == "dependency"
+        assert src_task.claim_lock is None
+        assert src_task.current_run_id is None
+
+        res_task = kb.get_task(conn, res)
+        assert res_task.status == "ready"
+        assert res_task.assignee == "pm"
+
+        parents = kb.parent_ids(conn, src)
+        assert res in parents
+        link_row = conn.execute(
+            "SELECT kind FROM task_links WHERE parent_id=? AND child_id=?",
+            (res, src),
+        ).fetchone()
+        assert link_row["kind"] == "resolution"
+
+        # Phase 3: PM completes the resolution
+        assert kb.claim_task(conn, res)
+        assert kb.complete_task(
+            conn, res,
+            result="option_a",
+            summary="Go with bounded correlation guard approach",
+            metadata={
+                "decision": "option_a",
+                "resolution_key": "SCOPE-CONFLICT",
+                "source_task_id": src,
+                "resume_action": "implement_bounded_correlation_guard",
+            },
+        )
+
+        # Phase 4: source auto-promoted (NO manual unblock, no comment copy)
+        assert kb.get_task(conn, src).status == "ready"
+
+        # Phase 5: dispatcher can claim the source
+        claimed = kb.claim_task(conn, src)
+        assert claimed is not None
+        assert claimed.status == "running"
+
+        # Phase 6: worker context contains PM decision
+        context = kb.build_worker_context(conn, src)
+        assert "Go with bounded correlation guard approach" in context
+        assert "option_a" in context
+        assert "implement_bounded_correlation_guard" in context

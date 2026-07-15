@@ -914,6 +914,10 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Task kind classification (e.g. "replacement", "escalation", "investigation").
+    # Added for the resolution-dependency / PM-handoff workflow. NULL for
+    # regular tasks.
+    task_kind: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -997,6 +1001,9 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            task_kind=(
+                row["task_kind"] if "task_kind" in keys and row["task_kind"] else None
             ),
         )
 
@@ -1986,6 +1993,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "task_kind" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "task_kind",
+            "task_kind TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2014,6 +2027,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+
+
+    # Resolution links need a ``kind`` column.
+    link_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_links'"
+    ).fetchone() is not None
+    if link_table_exists:
+        link_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_links)")}
+        if "kind" not in link_cols:
+            _add_column_if_missing(
+                conn, "task_links", "kind",
+                "kind TEXT NOT NULL DEFAULT ''",
+            )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -3236,6 +3262,149 @@ def _synthesize_ended_run(
     return int(cur.lastrowid or 0)
 
 
+
+# ---------------------------------------------------------------------------
+# Resolution dependency (PM handoff)
+# ---------------------------------------------------------------------------
+
+
+def _route_dependency_wait_in_txn(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    resolution_task_id: str,
+    resolution_key: str,
+) -> None:
+    """Transition source from ``running``/``ready`` -> ``todo`` (dependency wait)."""
+    conn.execute(
+        """UPDATE tasks
+              SET status        = 'todo',
+                  claim_lock    = NULL,
+                  claim_expires = NULL,
+                  worker_pid    = NULL,
+                  block_kind    = 'dependency'
+            WHERE id = ?
+              AND status IN ('running', 'ready')""",
+        (source_task_id,),
+    )
+    run_id = _end_run(
+        conn, source_task_id,
+        outcome="blocked", status="blocked",
+        summary=f"Waiting for resolution task {resolution_task_id} ({resolution_key})",
+    )
+    if run_id is None:
+        run_id = _synthesize_ended_run(
+            conn, source_task_id, outcome="blocked",
+            summary=f"Waiting for resolution task {resolution_task_id} ({resolution_key})",
+        )
+    _append_event(
+        conn, source_task_id, "dependency_wait",
+        {
+            "reason": f"Waiting for PM decision: {resolution_key}",
+            "kind": "dependency",
+            "resolution_task_id": resolution_task_id,
+            "resolution_key": resolution_key,
+        },
+        run_id=run_id,
+    )
+
+
+def create_resolution_dependency(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    assignee: str,
+    resolution_key: str,
+    title: str,
+    body: Optional[str] = None,
+    expected_source_run_id: Optional[int] = None,
+    idempotency_key: Optional[str] = None,
+) -> str:
+    """Atomically create a PM/resolution task and link it as source's parent."""
+    if not title or not title.strip():
+        raise ValueError("title is required")
+    if not resolution_key or not resolution_key.strip():
+        raise ValueError("resolution_key is required")
+    if not assignee or not assignee.strip():
+        raise ValueError("assignee is required")
+    assignee = assignee.strip().lower()
+    auto_key = f"resolution:{assignee}:{source_task_id}:{resolution_key}"
+    effective_key = idempotency_key or auto_key
+    with write_txn(conn):
+        src_row = conn.execute(
+            "SELECT id, status, current_run_id FROM tasks WHERE id = ?",
+            (source_task_id,),
+        ).fetchone()
+        if not src_row:
+            raise ValueError(f"source task {source_task_id} not found")
+        existing = None
+        if effective_key:
+            existing = conn.execute(
+                "SELECT id FROM tasks WHERE idempotency_key = ? "
+                "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                (effective_key,),
+            ).fetchone()
+        if existing:
+            tid = existing["id"]
+            s = src_row["status"]
+            if s in ("done", "archived", "review", "blocked"):
+                return tid
+            if s == "todo":
+                link = conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+                                     (tid, source_task_id)).fetchone()
+                if not link:
+                    conn.execute("INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, 'resolution')",
+                                 (tid, source_task_id))
+                return tid
+            if s == "running":
+                if expected_source_run_id is not None and src_row["current_run_id"] != expected_source_run_id:
+                    raise ValueError(
+                        f"current_run_id {src_row['current_run_id']} != "
+                        f"expected {expected_source_run_id}"
+                    )
+                link = conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+                                     (tid, source_task_id)).fetchone()
+                if not link:
+                    conn.execute("INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, 'resolution')",
+                                 (tid, source_task_id))
+                if expected_source_run_id is not None and src_row["current_run_id"] == expected_source_run_id:
+                    _route_dependency_wait_in_txn(conn, source_task_id, tid, resolution_key)
+                return tid
+            if s == "ready":
+                link = conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+                                     (tid, source_task_id)).fetchone()
+                if not link:
+                    conn.execute("INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, 'resolution')",
+                                 (tid, source_task_id))
+                if conn.execute("SELECT 1 FROM tasks WHERE id=? AND status='ready'", (source_task_id,)).fetchone():
+                    _route_dependency_wait_in_txn(conn, source_task_id, tid, resolution_key)
+                return tid
+            return tid
+        if src_row["status"] not in ("running", "ready"):
+            raise ValueError(
+                f"source task {source_task_id} expected status running or ready, "
+                f"got {src_row['status']!r}"
+            )
+        if expected_source_run_id is not None and src_row["current_run_id"] != expected_source_run_id:
+            raise ValueError(
+                f"current_run_id {src_row['current_run_id']} != "
+                f"expected {expected_source_run_id}"
+            )
+        tid = _new_task_id()
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO tasks (id, title, body, assignee, status, created_by, created_at, workspace_kind, idempotency_key) "
+            "VALUES (?, ?, ?, ?, 'ready', ?, ?, 'scratch', ?)",
+            (tid, title.strip(), body, assignee, assignee, now, effective_key),
+        )
+        _append_event(conn, tid, "created",
+                       {"assignee": assignee, "status": "ready",
+                        "resolution_key": resolution_key, "source_task_id": source_task_id})
+        conn.execute("INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, 'resolution')",
+                     (tid, source_task_id))
+        _route_dependency_wait_in_txn(conn, source_task_id, tid, resolution_key)
+        return tid
+
+
 # ---------------------------------------------------------------------------
 # Dependency resolution (todo -> ready)
 # ---------------------------------------------------------------------------
@@ -3327,12 +3496,18 @@ def recompute_ready(
                 # this predicate back).
                 continue
             parents = conn.execute(
-                "SELECT t.status FROM tasks t "
+                "SELECT t.status, COALESCE(l.kind, '') AS kind FROM tasks t "
                 "JOIN task_links l ON l.parent_id = t.id "
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            # Resolution links (kind='resolution') only satisfy when the
+            # parent is ``done`` — archived is NOT sufficient.
+            if all(
+                p["status"] == "done"
+                or (p["kind"] != "resolution" and p["status"] == "archived")
+                for p in parents
+            ):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4154,6 +4329,12 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    # A PM/reviewer resolution task may carry a structured routing decision
+    # for the source task it unblocks.  Apply it before recomputing ready
+    # tasks: otherwise a completed resolution parent would briefly (and, on a
+    # quiet dispatcher, permanently) resume the original task even when the
+    # decision says to replace, clarify, or supersede it.
+    _apply_completed_resolution_decision(conn, task_id, metadata)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
     # Clean up the scratch workspace and any stale tmux session for the worker.
@@ -5206,6 +5387,22 @@ def decompose_triage_task(
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     with write_txn(conn):
+        # Resolution links (kind='resolution') protect children from having
+        # their parent archived while still waiting (status='todo' with
+        # block_kind='dependency').
+        orphaned = conn.execute(
+            "SELECT 1 FROM task_links l "
+            "JOIN tasks t ON t.id = l.child_id "
+            "WHERE l.parent_id = ? AND l.kind = 'resolution' "
+            "AND t.status = 'todo' AND t.block_kind = 'dependency' "
+            "LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if orphaned:
+            raise ValueError(
+                f"cannot archive resolution parent {task_id}: "
+                f"child task(s) still waiting"
+            )
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
@@ -5641,6 +5838,8 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+REVIEW_AGENT_SKILL = "sdlc-review"
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -5744,6 +5943,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    skipped_invalid_skills: list[tuple[str, list[str]]] = field(default_factory=list)
+    """Review / ready task ids skipped because the required skill(s) could
+    not be resolved.  Each entry is ``(task_id, [missing_skill_name, ...])``."""
+    skipped_review_suppressed: list[tuple[str, str]] = field(default_factory=list)
+    """Review-status tasks skipped because their source has a pending
+    resolution parent or is in dependency wait."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7352,12 +7557,40 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+
+        # Review suppression guard: skip if source has pending resolution
+        # parent or is in dependency wait.
+        suppressed = check_review_suppressed_for_dispatch(conn, row["id"])
+        if suppressed:
+            result.skipped_review_suppressed.append((row["id"], suppressed))
+            continue
+
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+
+        # Preflight: verify the review skill is resolvable before claiming.
+        # A terminal/non-spawnable assignee is the more actionable reason and
+        # must win even when the review skill is not installed locally.
+        skill_ok, missing_skills = _check_review_skill_exists()
+        if not skill_ok:
+            result.skipped_invalid_skills.append((row["id"], missing_skills))
+            try:
+                existing = conn.execute(
+                    "SELECT 1 FROM task_events WHERE task_id = ? AND kind = 'review_dispatch_deferred' LIMIT 1",
+                    (row["id"],),
+                ).fetchone()
+                if existing is None:
+                    _append_event(
+                        conn, row["id"], "review_dispatch_deferred",
+                        {"reason": "missing_skill", "skill": REVIEW_AGENT_SKILL, "assignee": row["assignee"]},
+                    )
+            except Exception:
+                pass
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
@@ -7389,7 +7622,7 @@ def _dispatch_once_locked(
         # kanban lifecycle is already injected into every worker's system
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
-        claimed.skills = ["sdlc-review"]
+        claimed.skills = [REVIEW_AGENT_SKILL]
         _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
             import inspect
@@ -8748,3 +8981,458 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+# =============================================================================
+# Review-loop resolution — pure resolver, PM escalation, routing executor
+# =============================================================================
+
+from dataclasses import dataclass
+
+VALID_TASK_KINDS = frozenset({
+    "implementation", "review", "pm_resolution", "clarification",
+    "contract_fix", "replacement", "review_orchestration", "independent_review",
+})
+REVIEW_STOP_MAX_ROUNDS = "max_rounds"
+REVIEW_STOP_REPEATED_FINDING = "repeated_finding"
+REVIEW_STOP_SCOPE_CONFLICT = "scope_conflict"
+REVIEW_STOP_PROTECTED_BOUNDARY = "protected_boundary"
+REVIEW_STOP_DISPATCH_FAILURE = "dispatch_failure"
+REVIEW_STOP_MALFORMED_VERDICT = "malformed_verdict"
+REVIEW_STOP_AUTO_FIX_FAILURE = "auto_fix_failure"
+REVIEW_STOP_STALE_SHA = "stale_sha"
+REVIEW_LOOP_RESOLUTION_PREFIX = "review-loop"
+DEFAULT_MAX_REVIEW_ROUNDS = 3
+PM_ROUTING_RESUME = "resume_same_task"
+PM_ROUTING_REPLACEMENT = "create_replacement_task"
+PM_ROUTING_CLARIFICATION = "create_clarification_task"
+PM_ROUTING_CONTRACT_FIX = "create_contract_fix_task"
+PM_ROUTING_RETRY_REVIEW = "retry_review"
+PM_ROUTING_HUMAN_REVIEW = "human_review_required"
+PM_ROUTING_SUPERSEDE = "supersede_source_task"
+PM_ROUTING_CANCEL = "cancel_source_task"
+
+
+@dataclass
+class ReviewLoopAction:
+    action: str
+    reason_code: Optional[str] = None
+    resolution_key: Optional[str] = None
+    summary: Optional[str] = None
+    next_round: Optional[int] = None
+    reviewed_sha: Optional[str] = None
+    current_source_sha: Optional[str] = None
+
+
+def resolve_review_loop_action(*, source_task_id, review_task_id, review_round,
+    max_review_rounds=DEFAULT_MAX_REVIEW_ROUNDS, review_verdict=None,
+    findings=None, previous_findings=None,
+    reviewed_sha=None, current_source_sha=None,
+    worker_failure_kind=None, worker_failure_count=0,
+    source_scope=None, requested_changes=None,
+    max_worker_failures=3, has_pending_resolution=False):
+    def _fp(f):
+        if not f: return ""
+        raw = json.dumps({"code": f.get("finding_code") or f.get("acceptance_id") or "",
+            "file": f.get("file") or f.get("target_file") or "",
+            "symbol": f.get("symbol") or f.get("target_symbol") or "",
+            "summary": _normalize_finding_summary(f.get("summary") or f.get("finding") or "")},
+            sort_keys=True, ensure_ascii=False)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    def _fs(ff): return {_fp(f) for f in ff} if ff else set()
+
+    if has_pending_resolution:
+        return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code="pending_resolution",
+            resolution_key=_build_resolution_key(source_task_id, "pending_resolution", ""),
+            summary="Review loop suppressed")
+    if reviewed_sha and current_source_sha and reviewed_sha != current_source_sha:
+        return ReviewLoopAction(action="ignore_stale_review", reason_code=REVIEW_STOP_STALE_SHA)
+    if worker_failure_kind and worker_failure_count >= max_worker_failures:
+        return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_DISPATCH_FAILURE,
+            resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_DISPATCH_FAILURE, worker_failure_kind))
+    mr = _detect_malformed_verdict(review_verdict=review_verdict, findings=findings, reviewed_sha=reviewed_sha, requested_changes=requested_changes)
+    if mr:
+        return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_MALFORMED_VERDICT,
+            resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_MALFORMED_VERDICT, mr[:64]))
+    if review_verdict == "pass":
+        return ReviewLoopAction(action="complete_source_task", summary="Review passed", next_round=review_round)
+    if review_verdict == "changes_requested":
+        if review_round >= max_review_rounds:
+            return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_MAX_ROUNDS,
+                resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_MAX_ROUNDS, f"round{review_round}"))
+        if previous_findings and findings:
+            cfps = _fs(findings)
+            for prev in previous_findings:
+                if cfps & _fs(prev):
+                    return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_REPEATED_FINDING,
+                        resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_REPEATED_FINDING, sorted(cfps & _fs(prev))[0]))
+        sc = _detect_scope_conflict(requested_changes=requested_changes or [], source_scope=source_scope or "", findings=findings)
+        if sc:
+            return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_SCOPE_CONFLICT,
+                resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_SCOPE_CONFLICT, sc[:64]))
+        pb = _detect_protected_boundary_violation(findings)
+        if pb:
+            return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_PROTECTED_BOUNDARY,
+                resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_PROTECTED_BOUNDARY, pb[:64]))
+        return ReviewLoopAction(action="continue_with_implementation", next_round=review_round + 1)
+    return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_MALFORMED_VERDICT,
+        resolution_key=_build_resolution_key(source_task_id, REVIEW_STOP_MALFORMED_VERDICT, "unknown_verdict"))
+
+
+def _normalize_finding_summary(text):
+    text = text.lower().strip()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text[:256]
+
+
+def _build_resolution_key(source_task_id, reason_code, fp):
+    fp = fp.strip().replace(":", "_").replace(" ", "_")[:64] or "unknown"
+    return f"{REVIEW_LOOP_RESOLUTION_PREFIX}:{source_task_id}:{reason_code}:{fp}"
+
+
+def _detect_malformed_verdict(*, review_verdict, findings, reviewed_sha, requested_changes):
+    if not review_verdict: return "verdict is missing or empty"
+    if review_verdict not in ("pass", "changes_requested"): return f"unexpected verdict: {review_verdict!r}"
+    if not reviewed_sha: return "reviewed_sha is missing"
+    if review_verdict == "changes_requested":
+        if not findings and not requested_changes: return "changes_requested but no findings"
+        if findings:
+            for i, f in enumerate(findings):
+                if not f.get("summary") and not f.get("finding") and not f.get("finding_code"):
+                    return f"finding[{i}] has no summary or code"
+    return None
+
+
+def _detect_scope_conflict(*, requested_changes, source_scope, findings=None):
+    indicators = ["t3", "t4", "out of scope", "not in scope", "future", "separate task", "separate pr", "follow-up"]
+    for change in (requested_changes or []):
+        cl = change.lower()
+        for ind in indicators:
+            if ind in cl:
+                return f"Requested change references scope boundary '{ind}': {change[:120]}"
+    return None
+
+
+def _detect_protected_boundary_violation(findings):
+    indicators = ["protected_file", "protected_contract", "protected_spec", "adr", "architecture_decision_record", "shared_contract", "normative_spec"]
+    for f in (findings or []):
+        text = " ".join(str(v) for v in [f.get("summary"), f.get("finding"), f.get("finding_code"), f.get("file"), f.get("symbol"), f.get("requires_change")] if v).lower()
+        for ind in indicators:
+            if ind in text:
+                return f"Finding requires {ind}: {text[:200]}"
+    return None
+
+
+def escalate_review_loop_to_pm(conn, *, source_task_id, review_task_id, review_round,
+    reason_code, resolution_key, findings=None, previous_findings=None,
+    reviewed_sha=None, current_source_sha=None, expected_source_run_id=None,
+    source_title=None, source_branch=None, implementer_response=None,
+    scope_conflict=None, attempted_fixes=None, verification_results=None,
+    assignee="pm", board=None):
+    pm_title = f"PM routing required — review loop stopped for {source_title or source_task_id}"
+    body_lines = ["## Review Loop Escalation", "",
+        f"**Source task:** {source_task_id}", f"**Review task:** {review_task_id}",
+        f"**Branch:** {source_branch or '(unknown)'}",
+        f"**Current source SHA:** {current_source_sha or '(unknown)'}",
+        f"**Reviewed SHA:** {reviewed_sha or '(unknown)'}",
+        f"**Review round:** {review_round}", f"**Stop reason:** {reason_code}",
+        f"**Resolution key:** {resolution_key}", "",
+        "### Stop Reason", _REVIEW_STOP_REASON_DESCRIPTIONS.get(reason_code, reason_code), ""]
+    if findings:
+        body_lines.append("### Reviewer Findings")
+        for i, f in enumerate(findings, 1):
+            ft = f.get("summary") or f.get("finding") or "(no summary)"
+            body_lines.append(f"{i}. {ft}")
+            if f.get("file"): body_lines.append(f"   File: {f.get('file')}")
+            if f.get("finding_code"): body_lines.append(f"   Code: {f.get('finding_code')}")
+    if scope_conflict: body_lines.extend(["", "### Scope Conflict", scope_conflict])
+    if implementer_response: body_lines.extend(["", "### Implementer Response", implementer_response])
+    if attempted_fixes:
+        body_lines.extend(["", "### Attempted Fixes"])
+        body_lines.extend(f"- {fix}" for fix in attempted_fixes)
+    if verification_results: body_lines.extend(["", "### Verification Results", verification_results])
+    body_lines.extend(["", "### PM Decision Required", "Choose one:"])
+    for key, desc in [(PM_ROUTING_RESUME, "Resume"), (PM_ROUTING_REPLACEMENT, "Replacement"),
+        (PM_ROUTING_CLARIFICATION, "Clarify"), (PM_ROUTING_CONTRACT_FIX, "Contract fix"),
+        (PM_ROUTING_RETRY_REVIEW, "Retry review"), (PM_ROUTING_HUMAN_REVIEW, "Human review"),
+        (PM_ROUTING_SUPERSEDE, "Supersede"), (PM_ROUTING_CANCEL, "Cancel")]:
+        body_lines.append(f"- ``{key}`` — {desc}")
+    body = "\n".join(body_lines)
+    with write_txn(conn):
+        _append_event(conn, source_task_id, "review_loop_stopped", {
+            "source_task_id": source_task_id, "review_task_id": review_task_id,
+            "review_round": review_round, "reason_code": reason_code,
+            "reviewed_sha": reviewed_sha, "current_source_sha": current_source_sha,
+            "resolution_key": resolution_key})
+    try:
+        pm_id = create_resolution_dependency(conn, source_task_id=source_task_id, assignee=assignee,
+            resolution_key=resolution_key, title=pm_title, body=body,
+            expected_source_run_id=expected_source_run_id)
+    except ValueError as e:
+        _append_event(conn, source_task_id, "review_loop_escalated", {"failed": str(e)})
+        raise
+    _append_event(conn, source_task_id, "review_loop_escalated", {"pm_task_id": pm_id, "resolution_key": resolution_key})
+    _append_event(conn, pm_id, "resolution_dependency_created", {"source_task_id": source_task_id, "resolution_key": resolution_key, "review_round": review_round})
+    return pm_id
+
+
+_REVIEW_STOP_REASON_DESCRIPTIONS = {
+    REVIEW_STOP_MAX_ROUNDS: "Maximum review rounds reached without passing verdict.",
+    REVIEW_STOP_REPEATED_FINDING: "Same finding raised in consecutive rounds.",
+    REVIEW_STOP_SCOPE_CONFLICT: "Finding conflicts with implementation scope.",
+    REVIEW_STOP_PROTECTED_BOUNDARY: "Finding requires changes to protected files.",
+    REVIEW_STOP_DISPATCH_FAILURE: "Review worker repeatedly failed.",
+    REVIEW_STOP_MALFORMED_VERDICT: "Verdict missing required fields.",
+    REVIEW_STOP_AUTO_FIX_FAILURE: "Source task cannot be auto-fixed.",
+    "pending_resolution": "PM resolution already in-flight.",
+}
+
+
+def has_pending_resolution_parent(conn, task_id):
+    row = conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks t ON t.id=l.parent_id "
+        "WHERE l.child_id=? AND l.kind='resolution' AND t.status NOT IN ('done','archived') LIMIT 1",
+        (task_id,)).fetchone()
+    return row is not None
+
+
+def has_existing_review_loop_escalation(conn, source_task_id, resolution_key):
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE idempotency_key=? AND status!='archived' LIMIT 1",
+        (resolution_key,)).fetchone()
+    return row is not None
+
+
+def is_review_task_already_created(conn, source_task_id, reviewed_sha, review_round):
+    prefix = f"review:{source_task_id}:{reviewed_sha[:12]}:round{review_round}"
+    row = conn.execute(
+        "SELECT 1 FROM tasks WHERE idempotency_key LIKE ? AND status!='archived' LIMIT 1",
+        (f"{prefix}%",)).fetchone()
+    return row is not None
+
+
+@dataclass
+class PmRoutingDecision:
+    decision: str; source_task_id: str; resolution_key: str
+    resume_action: Optional[str] = None
+    review_round_action: Optional[str] = None
+    target_sha: Optional[str] = None
+    replacement_title: Optional[str] = None
+    replacement_body: Optional[str] = None
+    clarification_title: Optional[str] = None
+    clarification_body: Optional[str] = None
+    contract_fix_title: Optional[str] = None
+    contract_fix_body: Optional[str] = None
+    supersede_reason: Optional[str] = None
+    summary: Optional[str] = None
+    board: Optional[str] = None
+
+
+def parse_pm_routing_decision(metadata, source_task_id, resolution_key):
+    if not metadata or not metadata.get("decision"):
+        return PmRoutingDecision(decision=PM_ROUTING_RESUME, source_task_id=source_task_id, resolution_key=resolution_key)
+    return PmRoutingDecision(decision=str(metadata["decision"]),
+        source_task_id=str(metadata.get("source_task_id", source_task_id)), resolution_key=resolution_key,
+        resume_action=metadata.get("resume_action"), review_round_action=metadata.get("review_round_action"),
+        target_sha=metadata.get("target_sha"), replacement_title=metadata.get("replacement_title"),
+        replacement_body=metadata.get("replacement_body"), clarification_title=metadata.get("clarification_title"),
+        clarification_body=metadata.get("clarification_body"), contract_fix_title=metadata.get("contract_fix_title"),
+        contract_fix_body=metadata.get("contract_fix_body"), supersede_reason=metadata.get("supersede_reason"),
+        summary=metadata.get("summary"))
+
+
+def apply_pm_routing_decision(conn, decision, *, board=None):
+    # Completing a resolution task applies its decision automatically, but
+    # older callers may still invoke this helper explicitly.  Return the
+    # recorded result rather than duplicating replacement tasks/events.
+    prior_rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'pm_routing_applied' ORDER BY id DESC",
+        (decision.source_task_id,),
+    ).fetchall()
+    for row in prior_rows:
+        try:
+            prior = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if prior.get("resolution_key") == decision.resolution_key:
+            return prior
+    result = {"decision": decision.decision, "source_task_id": decision.source_task_id, "resolution_key": decision.resolution_key}
+    _append_event(conn, decision.source_task_id, "pm_routing_decided", result)
+    if decision.decision == PM_ROUTING_RESUME:
+        result["status"] = "promoted"
+    elif decision.decision == PM_ROUTING_REPLACEMENT:
+        repl_id = create_task(conn, title=decision.replacement_title or f"Replacement for {decision.source_task_id}",
+            body=decision.replacement_body, assignee=None, idempotency_key=f"replacement:{decision.resolution_key}")
+        conn.execute("UPDATE tasks SET task_kind='replacement' WHERE id=?", (repl_id,))
+        for pid in parent_ids(conn, decision.source_task_id):
+            link_tasks(conn, parent_id=pid, child_id=repl_id)
+        for cr in conn.execute("SELECT child_id FROM task_links WHERE parent_id=?", (decision.source_task_id,)).fetchall():
+            conn.execute("INSERT OR IGNORE INTO task_links (parent_id, child_id, kind) VALUES (?, ?, '')",
+                         (repl_id, cr["child_id"]))
+        _end_run(conn, decision.source_task_id, outcome="superseded",
+                 summary=f"Superseded by {repl_id}")
+        conn.execute("UPDATE tasks SET status='done', result='superseded', completed_at=? WHERE id=?",
+                     (int(time.time()), decision.source_task_id))
+        _append_event(conn, decision.source_task_id, "superseded", {"replacement_id": repl_id, "resolution_key": decision.resolution_key})
+        result["replacement_task_id"] = repl_id; result["status"] = "superseded"
+    elif decision.decision in (PM_ROUTING_CLARIFICATION, PM_ROUTING_CONTRACT_FIX):
+        nk = "clarification" if decision.decision == PM_ROUTING_CLARIFICATION else "contract_fix"
+        title = (
+            decision.clarification_title
+            if nk == "clarification"
+            else decision.contract_fix_title
+        ) or f"{nk.capitalize()} for {decision.source_task_id}"
+        body = (
+            decision.clarification_body
+            if nk == "clarification"
+            else decision.contract_fix_body
+        )
+        new_id = create_task(conn, title=title, body=body, assignee=None,
+            idempotency_key=f"{nk}:{decision.resolution_key}")
+        conn.execute("UPDATE tasks SET task_kind=? WHERE id=?", (nk, new_id))
+        link_tasks(conn, parent_id=new_id, child_id=decision.source_task_id)
+        _append_event(conn, decision.source_task_id, "parent_added", {"parent_id": new_id, "kind": nk})
+        result["new_task_id"] = new_id; result["status"] = "dependency_added"
+    elif decision.decision == PM_ROUTING_RETRY_REVIEW:
+        _append_event(conn, decision.source_task_id, "review_retry_requested", {"target_sha": decision.target_sha or ""})
+        result["target_sha"] = decision.target_sha or ""; result["status"] = "retry_pending"
+    elif decision.decision == PM_ROUTING_HUMAN_REVIEW:
+        conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=? AND status IN ('todo','ready')",
+                     (decision.source_task_id,))
+        _append_event(conn, decision.source_task_id, "blocked", {"kind": "needs_input", "reason": "human_review_required"})
+        result["status"] = "blocked_human_review"
+    elif decision.decision == PM_ROUTING_SUPERSEDE:
+        _end_run(conn, decision.source_task_id, outcome="superseded", summary=decision.supersede_reason or "PM decision")
+        conn.execute("UPDATE tasks SET status='done', result='superseded', completed_at=? WHERE id=?",
+                     (int(time.time()), decision.source_task_id))
+        _append_event(conn, decision.source_task_id, "superseded", {
+            "resolution_key": decision.resolution_key,
+            "no_replacement": True,
+            "reason": decision.supersede_reason or "PM decision",
+        })
+        result["status"] = "superseded"
+    elif decision.decision == PM_ROUTING_CANCEL:
+        _end_run(conn, decision.source_task_id, outcome="cancelled", summary=decision.summary or "Cancelled")
+        conn.execute("UPDATE tasks SET status='done', result='cancelled', completed_at=? WHERE id=?",
+                     (int(time.time()), decision.source_task_id))
+        result["status"] = "cancelled"
+    else:
+        result["status"] = "promoted_fallback"
+    _append_event(conn, decision.source_task_id, "pm_routing_applied", result)
+    return result
+
+
+def _resolution_key_for_parent(conn, resolution_task_id: str, source_task_id: str) -> str:
+    """Return the durable resolution key recorded when a parent was created."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? "
+        "AND kind = 'created' ORDER BY id ASC",
+        (resolution_task_id,),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if payload.get("source_task_id") == source_task_id and payload.get("resolution_key"):
+            return str(payload["resolution_key"])
+    # Legacy/manual resolution parents may lack the created-event metadata.
+    # Keep the fallback deterministic so an explicitly structured decision is
+    # still auditable and idempotent.
+    return f"resolution-parent:{resolution_task_id}:{source_task_id}"
+
+
+def _apply_completed_resolution_decision(
+    conn, resolution_task_id: str, metadata: Optional[dict],
+) -> None:
+    """Apply a PM routing decision attached to a completed resolution task.
+
+    Only source tasks linked by ``kind='resolution'`` may be addressed.  This
+    prevents a completion payload from routing an unrelated task and ensures
+    dependency release follows the decision rather than racing it.
+    """
+    if not isinstance(metadata, dict) or not metadata.get("decision"):
+        return
+    sources = [
+        row["child_id"]
+        for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? AND kind = 'resolution'",
+            (resolution_task_id,),
+        ).fetchall()
+    ]
+    requested_source = metadata.get("source_task_id")
+    if requested_source:
+        sources = [source for source in sources if source == str(requested_source)]
+    if len(sources) != 1:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                resolution_task_id,
+                "pm_routing_rejected",
+                {"reason": "resolution source is missing or ambiguous"},
+            )
+        return
+
+    source_task_id = sources[0]
+    resolution_key = _resolution_key_for_parent(
+        conn, resolution_task_id, source_task_id,
+    )
+    decision = parse_pm_routing_decision(metadata, source_task_id, resolution_key)
+    if decision.source_task_id != source_task_id:
+        with write_txn(conn):
+            _append_event(
+                conn,
+                resolution_task_id,
+                "pm_routing_rejected",
+                {"reason": "source_task_id is not a resolution child"},
+            )
+        return
+    apply_pm_routing_decision(conn, decision)
+
+
+def check_review_suppressed_for_dispatch(conn, source_task_id):
+    if has_pending_resolution_parent(conn, source_task_id):
+        return "pending resolution parent"
+    task = get_task(conn, source_task_id)
+    if task and task.status == "todo" and task.block_kind == "dependency":
+        return "dependency wait"
+    return None
+
+
+def _check_review_skill_exists():
+    """Check whether REVIEW_AGENT_SKILL is resolvable."""
+    try:
+        from agent.skill_commands import build_preloaded_skills_prompt
+        _, loaded, missing = build_preloaded_skills_prompt([REVIEW_AGENT_SKILL])
+        if loaded and REVIEW_AGENT_SKILL in loaded:
+            return True, []
+        return False, missing or [REVIEW_AGENT_SKILL]
+    except Exception:
+        return False, [REVIEW_AGENT_SKILL]
+
+
+def repair_orphaned_review_resolution(conn, source_task_id, *, dry_run=True, board=None):
+    source = get_task(conn, source_task_id)
+    if not source or source.status not in ("blocked", "todo"):
+        return None
+    candidates = conn.execute(
+        "SELECT id, idempotency_key FROM tasks WHERE idempotency_key LIKE 'resolution:pm:%' AND status='done' ORDER BY completed_at DESC LIMIT 5"
+    ).fetchall()
+    for cand in candidates:
+        key = cand["idempotency_key"] or ""
+        if source_task_id not in key:
+            continue
+        if conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=? AND kind='resolution'",
+                         (cand["id"], source_task_id)).fetchone():
+            continue
+        r = {"source_task_id": source_task_id, "pm_task_id": cand["id"], "resolution_key": key}
+        if dry_run:
+            r["action"] = "would_repair"
+        else:
+            conn.execute("INSERT INTO task_links (parent_id, child_id, kind) VALUES (?, ?, 'resolution')",
+                         (cand["id"], source_task_id))
+            if source.block_kind == "needs_input":
+                conn.execute("UPDATE tasks SET block_kind=NULL WHERE id=?", (source_task_id,))
+            r["action"] = "repaired"
+        return r
+    return None

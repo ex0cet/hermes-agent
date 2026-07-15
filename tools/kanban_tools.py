@@ -1299,7 +1299,13 @@ KANBAN_BLOCK_SCHEMA = {
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
-        "block on things you can resolve yourself."
+        "block on things you can resolve yourself.\n\n"
+        "IMPORTANT: If you need a PM / reviewer / scope-resolution decision "
+        "and want the source task to auto-resume when the decision is made, "
+        "do NOT use kanban_block — use ``kanban_request_resolution`` instead. "
+        "That tool creates a resolution task AND links it as your parent "
+        "in one atomic operation, so you resume automatically without manual "
+        "unblock."
     ),
     "parameters": {
         "type": "object",
@@ -1570,9 +1576,10 @@ KANBAN_UNBLOCK_SCHEMA = {
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
-        "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "Add a dependency link from parent to child. The child stays in "
+        "'todo' until the parent reaches 'done'; then it auto-promotes "
+        "to 'ready' for the dispatcher. Also used to manually link "
+        "a resolution task (parent) to its source task (child)."
     ),
     "parameters": {
         "type": "object",
@@ -1584,6 +1591,120 @@ KANBAN_LINK_SCHEMA = {
         "required": ["parent_id", "child_id"],
     },
 }
+
+
+KANBAN_REQUEST_RESOLUTION_SCHEMA = {
+    "name": "kanban_request_resolution",
+    "description": (
+        "Pause your task and create a PM / reviewer / scope-resolution "
+        "task in one atomic operation. The resolution task is created as "
+        "a **parent** of your current task, so when the PM completes it "
+        "with a decision, your task automatically resumes — no manual "
+        "unblock, no comment copy-paste, no separate kanban_block call.\n\n"
+        "Use this INSTEAD of the old kanban_create+kanban_block two-step "
+        "when you need a human decision before you can continue. The "
+        "resolution task lands in 'ready' so the PM can claim it "
+        "immediately; your task goes to 'todo' (dependency wait) and "
+        "auto-promotes to 'ready' once the resolution parent is 'done'.\n\n"
+        "``resolution_key`` is a short unique label the PM will see "
+        "(e.g. 'AC-CORR-04' or 'SCOPE-CONFLICT'). The same key is used "
+        "for idempotency: calling this tool again with the same "
+        "``source_task_id`` + ``resolution_key`` returns the existing "
+        "resolution task id without creating a duplicate."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "source_task_id": {
+                "type": "string",
+                "description": _DESC_TASK_ID_DEFAULT,
+            },
+            "assignee": {
+                "type": "string",
+                "description": (
+                    "Profile that should resolve this (e.g. 'pm', "
+                    "'reviewer', 'techlead'). Required."
+                ),
+            },
+            "resolution_key": {
+                "type": "string",
+                "description": (
+                    "Short unique key for this resolution decision "
+                    "(e.g. 'AC-CORR-04', 'SCOPE-CONFLICT'). Combined "
+                    "with source_task_id for idempotency."
+                ),
+            },
+            "title": {
+                "type": "string",
+                "description": "Short title for the resolution task (shown on the board).",
+            },
+            "description": {
+                "type": "string",
+                "description": (
+                    "Full context the PM needs to make this decision. "
+                    "This becomes the resolution task's body."
+                ),
+            },
+            "board": _board_schema_prop(),
+        },
+        "required": ["source_task_id", "assignee", "resolution_key", "title"],
+    },
+}
+
+
+def _handle_request_resolution(args: dict, **kw) -> str:
+    """Atomically create a PM/reviewer resolution task and pause source.
+
+    Wraps ``create_resolution_dependency()`` as a tool. The resolution
+    task is linked as a *resolution parent* of ``source_task_id`` so it
+    auto-promotes the source back to ``ready`` when the PM completes it.
+    No manual unblock or comment copy needed.
+    """
+    source_task_id = args.get("source_task_id")
+    if not source_task_id:
+        return tool_error("source_task_id is required")
+    assignee = args.get("assignee")
+    if not assignee:
+        return tool_error("assignee is required")
+    resolution_key = args.get("resolution_key")
+    if not resolution_key:
+        return tool_error("resolution_key is required")
+    title = args.get("title")
+    if not title or not str(title).strip():
+        return tool_error("title is required")
+    description = args.get("description")
+    board = args.get("board")
+
+    # Inherit the dispatcher-scoped run id when available so CAS is safe.
+    expected_run = _worker_run_id(str(source_task_id))
+
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            new_tid = kb.create_resolution_dependency(
+                conn,
+                source_task_id=str(source_task_id),
+                assignee=str(assignee),
+                resolution_key=str(resolution_key),
+                title=str(title).strip(),
+                body=str(description) if description else None,
+                expected_source_run_id=expected_run,
+            )
+            new_task = kb.get_task(conn, new_tid)
+            new_status = new_task.status if new_task else None
+            source_task = kb.get_task(conn, str(source_task_id))
+            return _ok(
+                resolution_task_id=new_tid,
+                resolution_status=new_status,
+                source_status=source_task.status if source_task else None,
+            )
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_request_resolution: {e}")
+    except Exception as e:
+        logger.exception("kanban_request_resolution failed")
+        return tool_error(f"kanban_request_resolution: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1624,6 +1745,15 @@ registry.register(
     handler=_handle_block,
     check_fn=_check_kanban_mode,
     emoji="⏸",
+)
+
+registry.register(
+    name="kanban_request_resolution",
+    toolset="kanban",
+    schema=KANBAN_REQUEST_RESOLUTION_SCHEMA,
+    handler=_handle_request_resolution,
+    check_fn=_check_kanban_mode,
+    emoji="🔐",
 )
 
 registry.register(
