@@ -4190,6 +4190,28 @@ def complete_task(
     """
     now = int(time.time())
 
+    # Independent-review completion is a control-plane transition, not merely
+    # a textual handoff.  Without a structured verdict the dispatcher cannot
+    # distinguish pass from changes-requested, so it must not accept the
+    # completion and silently strand the implementation task.
+    task_row = conn.execute(
+        "SELECT assignee, title FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    is_independent_review = bool(
+        task_row
+        and task_row["assignee"] == "reviewer"
+        and "independent review" in (task_row["title"] or "").lower()
+    )
+    if is_independent_review:
+        review = metadata.get("review") if isinstance(metadata, dict) else None
+        if not isinstance(review, dict) or not isinstance(review.get("target_task_id"), str) \
+                or review.get("verdict") not in _REVIEW_ALL_VERDICTS:
+            raise ValueError(
+                "independent reviewer completion requires metadata.review with "
+                "target_task_id and verdict (pass, pass-with-nits, "
+                "changes-requested, or blocked)"
+            )
+
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
     # tiny dedicated txn, then raise. The caller is responsible for

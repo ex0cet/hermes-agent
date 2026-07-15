@@ -1205,7 +1205,10 @@ class TestIndependentReviewVerdictApplication:
 
     def test_done_reviewer_without_structured_verdict_fails_closed(self, conn):
         source, reviewer = self._blocked_source_and_reviewer(conn)
-        _claim_and_complete(conn, reviewer, summary="Review complete")
+        assert claim_task(conn, reviewer) is not None
+        with pytest.raises(ValueError, match="metadata.review"):
+            complete_task(conn, reviewer, summary="Review complete")
+        assert get_task(conn, reviewer).status == "running"
         assert get_task(conn, source).status == "blocked"
 
     def test_blocked_verdict_preserves_review_required_block(self, conn):
