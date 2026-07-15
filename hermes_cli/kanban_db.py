@@ -4329,6 +4329,14 @@ def complete_task(
     # just tracks "is there a current pathology the breaker should
     # care about", and a success resets that question.
     _clear_failure_counter(conn, task_id)
+    # Independent reviews intentionally are not dependency parents of the
+    # implementation they inspect: an implementation task is blocked while
+    # waiting for the review, so such an edge would deadlock.  Their outcome
+    # must instead be applied explicitly and, crucially, only a structured
+    # verdict may release the target.  A reviewer card reaching ``done`` is
+    # not itself an approval (it can represent changes-requested or a hard
+    # stop).
+    _apply_completed_review_verdict(conn, task_id, metadata)
     # A PM/reviewer resolution task may carry a structured routing decision
     # for the source task it unblocks.  Apply it before recomputing ready
     # tasks: otherwise a completed resolution parent would briefly (and, on a
@@ -4348,6 +4356,81 @@ def complete_task(
         run_id=run_id,
         summary=(summary if summary is not None else result),
     )
+    return True
+
+
+_REVIEW_RELEASE_VERDICTS = frozenset({"pass", "pass-with-nits", "changes-requested"})
+_REVIEW_ALL_VERDICTS = _REVIEW_RELEASE_VERDICTS | frozenset({"blocked"})
+
+
+def _apply_completed_review_verdict(
+    conn: sqlite3.Connection,
+    reviewer_task_id: str,
+    metadata: Optional[dict],
+) -> bool:
+    """Apply a completed independent review's explicit verdict.
+
+    Review cards are deliberately independent from their implementation
+    targets.  The reviewer records a machine-readable ``metadata.review``
+    object, and this function is the only automatic bridge back to the
+    blocked target.  Missing or malformed metadata is fail-closed: it leaves
+    the target blocked rather than treating a completed card as approval.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    review = metadata.get("review")
+    if not isinstance(review, dict):
+        return False
+    target_id = review.get("target_task_id")
+    verdict = review.get("verdict")
+    if not isinstance(target_id, str) or not target_id.strip():
+        return False
+    if verdict not in _REVIEW_ALL_VERDICTS:
+        return False
+    target_id = target_id.strip()
+
+    # Bind the verdict to the exact review handoff.  This prevents a review
+    # worker (or stale completion) from releasing an unrelated blocked card.
+    block_event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (target_id,),
+    ).fetchone()
+    target = get_task(conn, target_id)
+    if target is None or target.status != "blocked" or block_event is None:
+        return False
+    try:
+        block_payload = json.loads(block_event["payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    reason = str(block_payload.get("reason") or "")
+    if f"reviewer task {reviewer_task_id}" not in reason:
+        return False
+
+    if verdict in _REVIEW_RELEASE_VERDICTS:
+        if not unblock_task(conn, target_id):
+            return False
+        event_kind = "review_verdict_applied"
+        applied = True
+    else:
+        # ``blocked`` is a genuine PM/human handoff.  Record the verdict but
+        # preserve the target's sticky review-required block.
+        event_kind = "review_verdict_requires_routing"
+        applied = False
+
+    with write_txn(conn):
+        _append_event(
+            conn,
+            target_id,
+            event_kind,
+            {
+                "reviewer_id": reviewer_task_id,
+                "verdict": verdict,
+                "reviewed_sha": review.get("reviewed_sha"),
+                "review_round": review.get("review_round"),
+                "applied": applied,
+            },
+        )
     return True
 
 

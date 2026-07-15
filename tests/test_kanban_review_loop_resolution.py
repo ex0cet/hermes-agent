@@ -1172,6 +1172,60 @@ class TestParsePmRoutingDecision:
 # ═════════════════════════════════════════════════════════════════════════════
 
 
+class TestIndependentReviewVerdictApplication:
+    """A reviewer card's terminal state is never an implicit approval."""
+
+    def _blocked_source_and_reviewer(self, conn):
+        source = _make_task(conn, title="Implementation", status="ready")
+        reviewer = _make_task(conn, title="Independent review", status="ready",
+                              assignee="reviewer")
+        assert kb.block_task(
+            conn,
+            source,
+            reason=f"review-required: reviewer task {reviewer}",
+        )
+        return source, reviewer
+
+    def test_changes_requested_releases_only_its_review_target(self, conn):
+        source, reviewer = self._blocked_source_and_reviewer(conn)
+        _claim_and_complete(
+            conn,
+            reviewer,
+            summary="Changes requested",
+            metadata={"review": {
+                "target_task_id": source,
+                "verdict": "changes-requested",
+                "reviewed_sha": "abc1234",
+                "review_round": 1,
+            }},
+        )
+        assert get_task(conn, source).status == "ready"
+        events = kb.list_events(conn, source)
+        assert any(e.kind == "review_verdict_applied" for e in events)
+
+    def test_done_reviewer_without_structured_verdict_fails_closed(self, conn):
+        source, reviewer = self._blocked_source_and_reviewer(conn)
+        _claim_and_complete(conn, reviewer, summary="Review complete")
+        assert get_task(conn, source).status == "blocked"
+
+    def test_blocked_verdict_preserves_review_required_block(self, conn):
+        source, reviewer = self._blocked_source_and_reviewer(conn)
+        _claim_and_complete(
+            conn,
+            reviewer,
+            summary="PM routing required",
+            metadata={"review": {
+                "target_task_id": source,
+                "verdict": "blocked",
+                "reviewed_sha": "abc1234",
+                "review_round": 1,
+            }},
+        )
+        assert get_task(conn, source).status == "blocked"
+        events = kb.list_events(conn, source)
+        assert any(e.kind == "review_verdict_requires_routing" for e in events)
+
+
 class TestNormalFlow:
 
     def test_changes_requested_goes_back_to_implementation(self):

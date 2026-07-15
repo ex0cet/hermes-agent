@@ -1233,7 +1233,12 @@ KANBAN_COMPLETE_SCHEMA = {
                 "description": (
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
-                    "\"findings\": [...]}. Surfaced to downstream "
+                    "\"findings\": [...]}. An independent reviewer must use "
+                    "{\"review\": {\"target_task_id\": \"t_...\", "
+                    "\"verdict\": \"pass|pass-with-nits|changes-requested|blocked\", "
+                    "\"reviewed_sha\": \"...\", \"review_round\": 1}}; "
+                    "Hermes applies only this explicit verdict to the blocked "
+                    "target. Surfaced to downstream "
                     "workers alongside ``summary``."
                 ),
             },
