@@ -99,6 +99,29 @@ def test_worker_block_on_child_with_done_parents_is_still_sticky(kanban_home: Pa
         assert kb.get_task(conn, child).status == "blocked"
 
 
+def test_review_required_dependency_kind_is_kept_sticky(kanban_home: Path) -> None:
+    """Independent-review waits cannot use dependency routing.
+
+    A reviewer is intentionally not a parent link, so dependency routing
+    would otherwise put this task in todo and immediately re-promote it.
+    """
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="review wait")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="review-required: reviewer task t_deadbeef",
+            kind="dependency",
+            expected_run_id=kb.get_task(conn, tid).current_run_id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind is None
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
 # ---------------------------------------------------------------------------
 # Circuit-breaker blocks still auto-recover (preserve #40c1decb3 intent)
 # ---------------------------------------------------------------------------

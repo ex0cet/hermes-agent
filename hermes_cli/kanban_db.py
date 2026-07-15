@@ -4841,6 +4841,14 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # An independent review is deliberately not a dependency edge: the
+    # implementation waits for its verdict, while making it a parent/child
+    # edge would deadlock the review.  Routing a ``review-required`` handoff
+    # through ``dependency`` without an actual parent link drops it into
+    # ``todo`` and lets recompute_ready() prematurely re-dispatch it.
+    # Keep it sticky until an explicit structured review verdict releases it.
+    if kind == "dependency" and (reason or "").strip().lower().startswith("review-required:"):
+        kind = None
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
