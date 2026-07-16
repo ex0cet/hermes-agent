@@ -450,6 +450,17 @@ class TestReviewRelease:
         ).fetchall()
         assert len(ev) == 1
 
+    def test_review_release_clears_human_block_marker(self, cron, conn):
+        src = self._setup(conn)
+        conn.execute("UPDATE tasks SET block_kind = 'needs_input' WHERE id = ?", (src,))
+        conn.commit()
+        cron.main(); pm = list_tasks(conn, assignee="pm")[0]
+        self._mk_reviewer(conn, pm, "pass", "abc1234")
+        cron.main()
+        released = get_task(conn, src)
+        assert released.status == "ready"
+        assert released.block_kind is None
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 7. 古い結果を拒否
