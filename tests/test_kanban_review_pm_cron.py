@@ -100,6 +100,28 @@ def test_running_old_sha_reviewer_is_not_quarantined(cron, conn):
     assert get_task(conn, old).status == "running"
 
 
+def test_accepted_remediation_successor_completes_blocked_source(cron, conn):
+    source = _make_task(conn, title="source", status="blocked")
+    gate = _make_task(conn, title="Gate", status="todo", assignee="reviewer", parents=(source,))
+    successor = _make_task(conn, title="successor", status="running")
+    pm = _make_task(conn, title="PM", status="done", assignee="pm")
+    kb.complete_task(conn, successor, summary="remediation complete")
+    reviewer = _make_task(conn, title="review", status="running", assignee="reviewer")
+    _complete_structured_review(conn, reviewer, {
+        "target_task_id": successor, "verdict": "pass", "reviewed_sha": "a" * 40,
+        "review_round": 1,
+    })
+    with kb.write_txn(conn):
+        kb._append_event(conn, source, "remediation_handoff_applied", {
+            "pm_task_id": pm, "successor_task_id": successor,
+            "retired_predecessor_task_ids": [],
+        })
+    assert cron._reconcile_completed_remediation_liveness(conn) == 1
+    assert get_task(conn, source).status == "done"
+    assert get_task(conn, gate).status == "ready"
+    assert any(e.kind == "remediation_successor_accepted" for e in kb.list_events(conn, source))
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
