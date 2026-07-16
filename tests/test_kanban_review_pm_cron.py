@@ -457,6 +457,20 @@ class TestReviewRelease:
 
 
 class TestStaleGuard:
+    def test_abbreviated_current_sha_matches_full_review_sha(self, cron, conn):
+        src = _make_task(conn, title="short-sha", status="running", assignee="dev")
+        full_sha = "a" * 40
+        _set_sha(conn, src, full_sha[:8]); conn.commit()
+        cron.main()
+        pm = list_tasks(conn, assignee="pm")[0]
+        rev = _make_task(conn, title="review", status="running",
+                         idempotency_key=f"review:{pm.idempotency_key}", assignee="rv")
+        _complete_structured_review(conn, rev, {
+            "verdict": "pass", "reviewed_sha": full_sha, "review_round": 1,
+        })
+        cron.main()
+        assert get_task(conn, src).status == "ready"
+
     def test_stale_sha_no_release(self, cron, conn):
         src = _make_task(conn, title="SS", status="running", assignee="dev")
         _set_sha(conn, src, "def4567"); conn.commit()  # current SHA

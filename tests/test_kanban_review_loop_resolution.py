@@ -188,6 +188,15 @@ class TestPureResolver:
         assert action.action == "ignore_stale_review"
         assert action.reason_code == kb.REVIEW_STOP_STALE_SHA
 
+    def test_abbreviated_sha_is_not_treated_as_stale(self):
+        sha = "a" * 40
+        action = kb.resolve_review_loop_action(
+            source_task_id="t_src", review_task_id="t_rev", review_round=1,
+            review_verdict="changes_requested", reviewed_sha=sha,
+            current_source_sha=sha[:8],
+        )
+        assert action.action != "ignore_stale_review"
+
     def test_worker_dispatch_failure_escalates(self):
         """8. reviewer worker retry上限 → PM escalation"""
         action = kb.resolve_review_loop_action(

@@ -9351,6 +9351,25 @@ PM_ROUTING_SUPERSEDE = "supersede_source_task"
 PM_ROUTING_CANCEL = "cancel_source_task"
 
 
+def same_commit_sha(left: Optional[str], right: Optional[str]) -> bool:
+    """Return whether two full/abbreviated Git SHAs identify one commit.
+
+    Review metadata often carries a full SHA while a block reason carries the
+    conventional seven-character abbreviation.  Treating those strings as
+    unequal wedges a valid review forever.  Prefix matching is deliberately
+    restricted to canonical hexadecimal SHAs of at least seven characters;
+    opaque identifiers still require exact equality.
+    """
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    left, right = left.lower(), right.lower()
+    if left == right:
+        return True
+    if not re.fullmatch(r"[0-9a-f]{7,40}", left) or not re.fullmatch(r"[0-9a-f]{7,40}", right):
+        return False
+    return left.startswith(right) or right.startswith(left)
+
+
 @dataclass
 class ReviewLoopAction:
     action: str
@@ -9383,7 +9402,7 @@ def resolve_review_loop_action(*, source_task_id, review_task_id, review_round,
         return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code="pending_resolution",
             resolution_key=_build_resolution_key(source_task_id, "pending_resolution", ""),
             summary="Review loop suppressed")
-    if reviewed_sha and current_source_sha and reviewed_sha != current_source_sha:
+    if reviewed_sha and current_source_sha and not same_commit_sha(reviewed_sha, current_source_sha):
         return ReviewLoopAction(action="ignore_stale_review", reason_code=REVIEW_STOP_STALE_SHA)
     if worker_failure_kind and worker_failure_count >= max_worker_failures:
         return ReviewLoopAction(action="escalate_to_pm_resolution", reason_code=REVIEW_STOP_DISPATCH_FAILURE,
