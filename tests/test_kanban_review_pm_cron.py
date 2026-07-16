@@ -468,6 +468,13 @@ class TestReviewRelease:
 
 
 class TestStaleGuard:
+    def test_latest_review_block_sha_wins_over_old_handoff(self, cron, conn):
+        src = _make_task(conn, title="multiple handoffs", status="running", assignee="dev")
+        _set_sha(conn, src, "aaaaaaa")
+        # A later review request supersedes the original target.
+        _block_with_reason(conn, src, "review-required: SHA=bbbbbbb")
+        assert cron._resolve_sha_from_events(conn, src) == "bbbbbbb"
+
     def test_abbreviated_current_sha_matches_full_review_sha(self, cron, conn):
         src = _make_task(conn, title="short-sha", status="running", assignee="dev")
         full_sha = "a" * 40

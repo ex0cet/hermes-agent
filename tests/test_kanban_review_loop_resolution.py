@@ -498,6 +498,17 @@ class TestPmEscalation:
 
 
 class TestPmRouting:
+    def test_prose_pm_metadata_is_not_rejected_as_resolution_routing(self, conn):
+        """Review orchestration uses a free-text decision field for notes."""
+        pm_id = _make_task(conn, title="PM orchestration", assignee="pm")
+        _claim_and_complete(
+            conn, pm_id, result="review dispatched",
+            metadata={"decision": "Fresh SHA was reviewed; no duplicate reviewer was created."},
+        )
+        events = kb.list_events(conn, pm_id)
+        assert any(e.kind == "pm_routing_ignored" for e in events)
+        assert not any(e.kind == "pm_routing_rejected" for e in events)
+
 
     def test_completed_resolution_applies_clarification_before_source_resumes(self, conn):
         """A PM completion must add the clarification parent before ready recomputation."""

@@ -9349,6 +9349,16 @@ PM_ROUTING_RETRY_REVIEW = "retry_review"
 PM_ROUTING_HUMAN_REVIEW = "human_review_required"
 PM_ROUTING_SUPERSEDE = "supersede_source_task"
 PM_ROUTING_CANCEL = "cancel_source_task"
+PM_ROUTING_DECISIONS = frozenset({
+    PM_ROUTING_RESUME,
+    PM_ROUTING_REPLACEMENT,
+    PM_ROUTING_CLARIFICATION,
+    PM_ROUTING_CONTRACT_FIX,
+    PM_ROUTING_RETRY_REVIEW,
+    PM_ROUTING_HUMAN_REVIEW,
+    PM_ROUTING_SUPERSEDE,
+    PM_ROUTING_CANCEL,
+})
 
 
 def same_commit_sha(left: Optional[str], right: Optional[str]) -> bool:
@@ -9711,6 +9721,17 @@ def _apply_completed_resolution_decision(
     dependency release follows the decision rather than racing it.
     """
     if not isinstance(metadata, dict) or not metadata.get("decision"):
+        return
+    # ``decision`` is a common free-text field in PM/reviewer handoff
+    # metadata.  Only the closed routing vocabulary below is executable.  A
+    # prose orchestration decision must never be mistaken for a resolution
+    # command merely because the task happened to complete.
+    if metadata.get("decision") not in PM_ROUTING_DECISIONS:
+        with write_txn(conn):
+            _append_event(
+                conn, resolution_task_id, "pm_routing_ignored",
+                {"reason": "non_routing_decision_metadata"},
+            )
         return
     sources = [
         row["child_id"]
