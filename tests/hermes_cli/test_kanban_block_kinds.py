@@ -200,3 +200,63 @@ def test_block_without_kind_is_backward_compatible(kanban_home: Path) -> None:
         t = kb.get_task(conn, tid)
         assert t.status == "blocked"
         assert t.block_kind is None
+
+
+# ---------------------------------------------------------------------------
+# Structured retry policy
+# ---------------------------------------------------------------------------
+
+
+def test_expired_transient_retry_is_released_with_audit_event(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        assert kb.block_task(
+            conn, tid, reason="provider is rate limited", kind="transient",
+            policy={
+                "reason_code": "provider.rate_limited",
+                "retry_after": 100,
+                "fallback": "retry",
+                "auto_resume": True,
+            },
+        )
+        assert kb.reconcile_auto_resumable_blocks(conn, now=100) == [tid]
+        assert kb.get_task(conn, tid).status == "ready"
+        events = kb.list_events(conn, tid)
+        assert events[-1].kind == "block_retry_released"
+        assert events[-1].payload["reason_code"] == "provider.rate_limited"
+
+
+def test_retry_policy_waits_for_its_deadline(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        kb.block_task(
+            conn, tid, reason="temporary outage", kind="transient",
+            policy={"reason_code": "provider.outage", "retry_after": 101,
+                    "fallback": "retry", "auto_resume": True},
+        )
+        assert kb.reconcile_auto_resumable_blocks(conn, now=100) == []
+        assert kb.get_task(conn, tid).status == "blocked"
+
+
+def test_needs_input_policy_cannot_auto_resume(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="needs_input can never"):
+            kb.block_task(
+                conn, tid, reason="choose a target", kind="needs_input",
+                policy={"reason_code": "scope.choice", "retry_after": 100,
+                        "fallback": "retry", "auto_resume": True},
+            )
+
+
+def test_policy_requires_machine_reason_and_safe_retry_shape(kanban_home: Path) -> None:
+    with kb.connect_closing() as conn:
+        tid = _running_task(conn)
+        with pytest.raises(ValueError, match="reason_code"):
+            kb.block_task(conn, tid, reason="temporary", kind="transient", policy={})
+        with pytest.raises(ValueError, match="fallback='retry'"):
+            kb.block_task(
+                conn, tid, reason="temporary", kind="transient",
+                policy={"reason_code": "temporary.failure", "retry_after": 100,
+                        "auto_resume": True},
+            )

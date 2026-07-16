@@ -124,6 +124,13 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
+# Machine-readable policy attached to a ``blocked`` event.  This intentionally
+# stays event-sourced rather than adding another mutable task column: the
+# policy belongs to one blocking attempt and must not be accidentally reused
+# after a later worker has made progress.
+_BLOCK_POLICY_KEYS = frozenset({"reason_code", "retry_after", "fallback", "auto_resume"})
+_BLOCK_REASON_CODE_RE = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
+
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -4359,6 +4366,7 @@ def complete_task(
     # not itself an approval (it can represent changes-requested or a hard
     # stop).
     _apply_completed_review_verdict(conn, task_id, metadata)
+    _apply_completed_remediation_handoff(conn, task_id, metadata)
     # A PM/reviewer resolution task may carry a structured routing decision
     # for the source task it unblocks.  Apply it before recomputing ready
     # tasks: otherwise a completed resolution parent would briefly (and, on a
@@ -4381,8 +4389,26 @@ def complete_task(
     return True
 
 
-_REVIEW_RELEASE_VERDICTS = frozenset({"pass", "pass-with-nits", "changes-requested"})
+_REVIEW_RELEASE_VERDICTS = frozenset({"pass", "pass-with-nits"})
 _REVIEW_ALL_VERDICTS = _REVIEW_RELEASE_VERDICTS | frozenset({"blocked"})
+_REVIEW_ALL_VERDICTS = _REVIEW_ALL_VERDICTS | frozenset({"changes-requested"})
+
+
+def _review_requires_pm_remediation(review: dict) -> bool:
+    """Return whether an explicit verdict must retain the target hold.
+
+    A first ``changes-requested`` is routine rework and may return to the
+    implementation owner.  A second (or malformed/unknown) round is the
+    non-convergence boundary: retain the hold and route it through PM so a
+    bounded remediation is recorded before another independent review.
+    """
+    verdict = review.get("verdict")
+    if verdict == "blocked":
+        return True
+    if verdict != "changes-requested":
+        return False
+    round_ = review.get("review_round")
+    return not isinstance(round_, int) or isinstance(round_, bool) or round_ >= 2
 
 
 def _apply_completed_review_verdict(
@@ -4429,14 +4455,17 @@ def _apply_completed_review_verdict(
     if f"reviewer task {reviewer_task_id}" not in reason:
         return False
 
-    if verdict in _REVIEW_RELEASE_VERDICTS:
+    if verdict in _REVIEW_RELEASE_VERDICTS or (
+        verdict == "changes-requested" and not _review_requires_pm_remediation(review)
+    ):
         if not unblock_task(conn, target_id):
             return False
         event_kind = "review_verdict_applied"
         applied = True
     else:
-        # ``blocked`` is a genuine PM/human handoff.  Record the verdict but
-        # preserve the target's sticky review-required block.
+        # A blocked verdict, or changes-requested after the first review
+        # round, is a genuine PM remediation handoff. Record it but preserve
+        # the target's sticky review-required block.
         event_kind = "review_verdict_requires_routing"
         applied = False
 
@@ -4453,6 +4482,86 @@ def _apply_completed_review_verdict(
                 "applied": applied,
             },
         )
+    return True
+
+
+def _apply_completed_remediation_handoff(
+    conn: sqlite3.Connection,
+    pm_task_id: str,
+    metadata: Optional[dict],
+) -> bool:
+    """Atomically retire obsolete remediation parents named by a PM handoff.
+
+    A replacement remediation is often linked as a new parent of a source
+    task.  Leaving its failed predecessor linked as well makes the source
+    permanently unrunnable even after the replacement succeeds.  PM workers
+    therefore complete with a machine-readable ``remediation_handoff``; this
+    control-plane bridge removes only the explicitly named obsolete edges.
+    Missing or malformed metadata is fail-closed and is reconciled by the PM
+    cron rather than guessing which dependency may safely be removed.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    handoff = metadata.get("remediation_handoff")
+    if not isinstance(handoff, dict):
+        return False
+    source_id = handoff.get("source_task_id")
+    successor_id = handoff.get("successor_task_id")
+    retired_ids = handoff.get("retired_predecessor_task_ids")
+    if not isinstance(source_id, str) or not isinstance(successor_id, str):
+        return False
+    if not isinstance(retired_ids, list) or any(not isinstance(tid, str) for tid in retired_ids):
+        return False
+    if source_id == successor_id or successor_id in retired_ids:
+        return False
+
+    source = get_task(conn, source_id)
+    successor = get_task(conn, successor_id)
+    if source is None or successor is None or successor.status == "archived":
+        return False
+
+    retired_ids = list(dict.fromkeys(retired_ids))
+    # Validate every requested mutation before changing the graph.
+    for predecessor_id in retired_ids:
+        predecessor = get_task(conn, predecessor_id)
+        edge = conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id = ? AND child_id = ?",
+            (predecessor_id, source_id),
+        ).fetchone()
+        if predecessor is None or edge is None:
+            return False
+
+    with write_txn(conn):
+        for predecessor_id in retired_ids:
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (predecessor_id, source_id),
+            )
+            _append_event(conn, source_id, "unlinked", {
+                "parent": predecessor_id,
+                "child": source_id,
+                "reason": "remediation_replaced",
+                "pm_task_id": pm_task_id,
+            })
+            # The predecessor is intentionally obsolete, not resolved. Archive
+            # it so it cannot be reclaimed or selected by later reconciliation.
+            conn.execute(
+                "UPDATE tasks SET status = 'archived', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL WHERE id = ? "
+                "AND status NOT IN ('done', 'archived', 'cancelled')",
+                (predecessor_id,),
+            )
+            _append_event(conn, predecessor_id, "archived", {
+                "reason": "remediation_replaced",
+                "replacement_id": successor_id,
+                "source_task_id": source_id,
+                "pm_task_id": pm_task_id,
+            })
+        _append_event(conn, source_id, "remediation_handoff_applied", {
+            "pm_task_id": pm_task_id,
+            "successor_task_id": successor_id,
+            "retired_predecessor_task_ids": retired_ids,
+        })
     return True
 
 
@@ -4830,6 +4939,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    policy: Optional[dict[str, Any]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -4863,6 +4973,7 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    policy = _validate_block_policy(kind, policy)
     # An independent review is deliberately not a dependency edge: the
     # implementation waits for its verdict, while making it a parent/child
     # edge would deadlock the review.  Routing a ``review-required`` handoff
@@ -4921,7 +5032,7 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                {"reason": reason, "kind": kind, "policy": policy}, run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -4987,6 +5098,7 @@ def block_task(
                     "kind": kind,
                     "recurrences": recurrences,
                     "limit": BLOCK_RECURRENCE_LIMIT,
+                    "policy": policy,
                 },
                 run_id=run_id,
             )
@@ -5040,7 +5152,12 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
+                {
+                    "reason": reason,
+                    "kind": kind,
+                    "recurrences": recurrences,
+                    "policy": policy,
+                },
                 run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
@@ -5053,6 +5170,108 @@ def block_task(
         reason=reason,
     )
     return True
+
+
+def _validate_block_policy(
+    kind: Optional[str], policy: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Validate and normalize the optional per-attempt block policy.
+
+    Only an explicitly bounded retry is eligible for automatic recovery.
+    ``needs_input`` is deliberately never auto-resumed: doing so would turn a
+    missing decision into silent guesswork.  ``fallback`` is recorded even
+    when no retry is requested so operators can see the worker's intended
+    next path, but the reconciler executes only ``fallback=retry``.
+    """
+    if policy is None:
+        return None
+    if not isinstance(policy, dict):
+        raise ValueError("block policy must be a JSON object")
+    unknown = set(policy) - _BLOCK_POLICY_KEYS
+    if unknown:
+        raise ValueError(f"unknown block policy keys: {sorted(unknown)}")
+    if kind not in {"needs_input", "capability", "transient"}:
+        raise ValueError("block policy requires kind needs_input, capability, or transient")
+
+    normalized: dict[str, Any] = {}
+    reason_code = policy.get("reason_code")
+    if not isinstance(reason_code, str) or not _BLOCK_REASON_CODE_RE.fullmatch(reason_code):
+        raise ValueError("block policy reason_code must be a lowercase machine-readable code")
+    normalized["reason_code"] = reason_code
+
+    fallback = policy.get("fallback")
+    if fallback is not None:
+        if not isinstance(fallback, str) or not fallback.strip() or len(fallback) > 80:
+            raise ValueError("block policy fallback must be a short non-empty string")
+        normalized["fallback"] = fallback
+
+    auto_resume = policy.get("auto_resume", False)
+    if not isinstance(auto_resume, bool):
+        raise ValueError("block policy auto_resume must be boolean")
+    retry_after = policy.get("retry_after")
+    if retry_after is not None:
+        if isinstance(retry_after, bool) or not isinstance(retry_after, int) or retry_after <= 0:
+            raise ValueError("block policy retry_after must be a positive Unix timestamp")
+        normalized["retry_after"] = retry_after
+    if auto_resume:
+        if kind not in {"capability", "transient"}:
+            raise ValueError("needs_input can never be auto-resumed")
+        if retry_after is None or fallback != "retry":
+            raise ValueError("auto_resume requires retry_after and fallback='retry'")
+        normalized["auto_resume"] = True
+    elif "auto_resume" in policy:
+        normalized["auto_resume"] = False
+    return normalized
+
+
+def reconcile_auto_resumable_blocks(
+    conn: sqlite3.Connection, *, now: Optional[int] = None,
+) -> list[str]:
+    """Resume only expired, explicitly-safe retry blocks.
+
+    This is intended for the cron reconciler.  It never guesses at human
+    input, never resumes legacy blocks, and leaves an auditable event before
+    the dispatcher can claim the task again.  The normal re-block recurrence
+    breaker remains the backstop for a failure that persists after retry.
+    """
+    cutoff = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT t.id, t.block_kind, e.payload FROM tasks t "
+        "JOIN task_events e ON e.id = ("
+        "  SELECT e2.id FROM task_events e2 WHERE e2.task_id = t.id "
+        "  AND e2.kind = 'blocked' ORDER BY e2.id DESC LIMIT 1"
+        ") WHERE t.status = 'blocked' AND t.block_kind IN ('capability', 'transient')"
+    ).fetchall()
+    resumed: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        policy = payload.get("policy") if isinstance(payload, dict) else None
+        if not isinstance(policy, dict):
+            continue
+        if (
+            policy.get("auto_resume") is not True
+            or policy.get("fallback") != "retry"
+            or not isinstance(policy.get("retry_after"), int)
+            or policy["retry_after"] > cutoff
+            or not isinstance(policy.get("reason_code"), str)
+        ):
+            continue
+        if unblock_task(conn, row["id"]):
+            _append_event(
+                conn,
+                row["id"],
+                "block_retry_released",
+                {
+                    "reason_code": policy["reason_code"],
+                    "retry_after": policy["retry_after"],
+                    "fallback": "retry",
+                },
+            )
+            resumed.append(row["id"])
+    return resumed
 
 
 
@@ -7197,7 +7416,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
             "WHERE task_id = ? AND created_at >= ? "
-            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed') "
+            "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed', 'resurrected') "
             "LIMIT 1",
             (task_id, completed_at),
         ).fetchone()

@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -63,14 +64,34 @@ def _active_cron_provider_name() -> str:
         return "builtin"
 
 
+def _standalone_cron_daemon_pid() -> int | None:
+    """Return the live PID of the supported WSL standalone cron runner.
+
+    The built-in scheduler normally lives in the gateway, but WSL deployments
+    may run ``hermes cron tick`` under the managed ``run/cron-daemon.pid``
+    runner.  Treat a stale or malformed pidfile as absent.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        raw = (get_hermes_home() / "run" / "cron-daemon.pid").read_text().strip()
+        pid = int(raw)
+        if pid <= 0:
+            return None
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
 def _warn_if_gateway_not_running() -> None:
     """Warn that scheduled jobs won't fire unless the gateway is running.
 
-    The cron ticker only runs inside the gateway (``_start_cron_ticker`` in
-    gateway/run.py); there is no standalone cron daemon. Without a running
-    gateway, ``next_run_at`` passes but jobs never fire and ``last_run_at``
-    stays null — the most common cron support report (#51038). Surfacing this
-    at create/list time, when the user is right there, prevents it.
+    The normal cron ticker runs inside the gateway (``_start_cron_ticker`` in
+    gateway/run.py).  WSL deployments may instead run the supported managed
+    standalone runner at ``run/cron-daemon.pid``.  If neither is live,
+    ``next_run_at`` passes but jobs never fire and ``last_run_at`` stays null.
+    Surfacing that at create/list time prevents the common support failure.
 
     An external provider (e.g. Chronos) fires jobs via a NAS-mediated webhook,
     NOT the in-process ticker, so a momentarily-absent gateway process does not
@@ -84,7 +105,7 @@ def _warn_if_gateway_not_running() -> None:
 
         from hermes_cli.gateway import find_gateway_pids
 
-        if find_gateway_pids():
+        if find_gateway_pids() or _standalone_cron_daemon_pid() is not None:
             return
     except Exception:
         # If we can't determine gateway state, stay quiet rather than nag.
@@ -220,8 +241,13 @@ def cron_status():
         print()
         return
 
+    standalone_pid = _standalone_cron_daemon_pid()
     pids = find_gateway_pids()
-    if pids:
+    if standalone_pid is not None and not pids:
+        print(color("✓ Standalone cron daemon is running — cron jobs will fire automatically", Colors.GREEN))
+        print(f"  PID: {standalone_pid}")
+        print(color("  Runner: ~/.hermes/bin/hermes-cron-daemon (periodic `hermes cron tick`)", Colors.DIM))
+    elif pids:
         # The gateway PROCESS is alive — but the cron ticker THREAD inside it
         # can die silently, or stay alive while every tick fails. Check both
         # the liveness heartbeat and the last-successful-tick marker so we

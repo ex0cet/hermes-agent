@@ -1203,6 +1203,44 @@ class TestIndependentReviewVerdictApplication:
         events = kb.list_events(conn, source)
         assert any(e.kind == "review_verdict_applied" for e in events)
 
+    def test_second_round_changes_requested_preserves_target_for_pm(self, conn):
+        source, reviewer = self._blocked_source_and_reviewer(conn)
+        _claim_and_complete(
+            conn,
+            reviewer,
+            summary="Second-round changes requested",
+            metadata={"review": {
+                "target_task_id": source,
+                "verdict": "changes-requested",
+                "reviewed_sha": "abc1234",
+                "review_round": 2,
+            }},
+        )
+        assert get_task(conn, source).status == "blocked"
+        events = kb.list_events(conn, source)
+        assert any(e.kind == "review_verdict_requires_routing" for e in events)
+
+    def test_remediation_handoff_retires_obsolete_parent_atomically(self, conn):
+        source = _make_task(conn, title="Implementation", status="ready")
+        obsolete = _make_task(conn, title="Old remediation", status="blocked")
+        successor = _make_task(conn, title="Replacement remediation", status="ready")
+        pm = _make_task(conn, title="PM remediation", status="ready", assignee="pm")
+        kb.link_tasks(conn, obsolete, source)
+        kb.link_tasks(conn, successor, source)
+
+        assert kb._apply_completed_remediation_handoff(conn, pm, {
+            "remediation_handoff": {
+                "source_task_id": source,
+                "successor_task_id": successor,
+                "retired_predecessor_task_ids": [obsolete],
+            }
+        })
+        assert get_task(conn, obsolete).status == "archived"
+        assert (obsolete not in parent_ids(conn, source))
+        assert successor in parent_ids(conn, source)
+        events = kb.list_events(conn, source)
+        assert any(e.kind == "remediation_handoff_applied" for e in events)
+
     def test_done_reviewer_without_structured_verdict_fails_closed(self, conn):
         source, reviewer = self._blocked_source_and_reviewer(conn)
         assert claim_task(conn, reviewer) is not None

@@ -63,6 +63,43 @@ def _cron_count(conn) -> int:
     return len(list_tasks(conn, assignee="pm"))
 
 
+def _complete_structured_review(conn, task_id: str, review: dict[str, Any]) -> None:
+    complete_task(conn, task_id, result=None, summary=review["verdict"],
+                  metadata={"review": review})
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, 'done', 1, 1, 'completed', ?)",
+        (task_id, json.dumps({"review": review})),
+    )
+    conn.commit()
+
+
+def test_stale_unclaimed_reviewer_for_old_sha_is_quarantined(cron, conn):
+    source = _make_task(conn, title="source", status="running")
+    _block_with_reason(conn, source, "review-required: SHA=bbbbbbb")
+    old = _make_task(
+        conn, title="old reviewer", status="ready", assignee="reviewer",
+        task_kind="independent_review",
+        idempotency_key=f"review:{source}:aaaaaaa:1",
+    )
+    assert cron._quarantine_stale_review_artifacts(conn) == 1
+    assert get_task(conn, old).status == "archived"
+    event = [e for e in kb.list_events(conn, old) if e.kind == "quarantined_stale_review"][-1]
+    assert event.payload["current_sha"] == "bbbbbbb"
+
+
+def test_running_old_sha_reviewer_is_not_quarantined(cron, conn):
+    source = _make_task(conn, title="source", status="running")
+    _block_with_reason(conn, source, "review-required: SHA=bbbbbbb")
+    old = _make_task(
+        conn, title="old reviewer", status="running", assignee="reviewer",
+        task_kind="independent_review",
+        idempotency_key=f"review:{source}:aaaaaaa:1",
+    )
+    assert cron._quarantine_stale_review_artifacts(conn) == 0
+    assert get_task(conn, old).status == "running"
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
@@ -230,11 +267,11 @@ class TestIdempotency:
 
 
 class TestCasTransition:
-    def test_blocked_to_review_after_pm_created(self, cron, conn):
+    def test_blocked_review_hold_is_preserved_after_pm_created(self, cron, conn):
         src = _make_task(conn, title="T", status="running", assignee="dev")
         _block_with_reason(conn, src, "review-required:"); conn.commit()
         cron.main()
-        assert get_task(conn, src).status == "review"
+        assert get_task(conn, src).status == "blocked"
         assert list_tasks(conn, assignee="pm")[0].status == "ready"
 
     def test_cas_rejects_mismatch(self, cron, conn):
@@ -247,9 +284,9 @@ class TestCasTransition:
         src = _make_task(conn, title="CF", status="running", assignee="dev")
         _block_with_reason(conn, src, "review-required:"); conn.commit()
 
-        # First run creates PM and transitions to review
+        # First run creates PM but preserves the review hold.
         cron.main()
-        assert get_task(conn, src).status == "review"
+        assert get_task(conn, src).status == "blocked"
         pm1 = list_tasks(conn, assignee="pm")
         assert len(pm1) == 1
 
@@ -346,22 +383,49 @@ class TestReviewRelease:
         assert get_task(conn, src).status == "ready"
         assert "released" in out
 
-    def test_changes_requested_releases_source(self, cron, conn):
-        """changes-requested も review → ready へ (devがrework可能に)"""
+    def test_changes_requested_preserves_source_hold(self, cron, conn):
+        """changes-requested は remediation が作られるまで source を release しない。"""
         src = self._setup(conn)
         cron.main(); pm = list_tasks(conn, assignee="pm")[0]
-        self._mk_reviewer(conn, pm, "changes-requested", "abc1234")
+        reviewer = self._mk_reviewer(conn, pm, "changes-requested", "abc1234")
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": src,
+            "verdict": "changes-requested",
+            "reviewed_sha": "abc1234",
+            "review_round": 2,
+            "findings": [{"detail": "bounded fix"}],
+        })
         out = _capture(cron.main)
-        assert get_task(conn, src).status == "ready", \
-            f"Expected ready for changes-requested, got {get_task(conn, src).status}"
-        assert "released" in out
+        assert get_task(conn, src).status == "blocked"
+        escalations = [task for task in list_tasks(conn, assignee="pm")
+                       if "review-remediation" in (task.idempotency_key or "")]
+        assert len(escalations) == 1
+        assert escalations[0].status == "ready"
+        assert "remediation PM escalation" in out
+
+    def test_completed_remediation_pm_without_successor_reopens(self, cron, conn):
+        src = self._setup(conn)
+        cron.main(); pm = list_tasks(conn, assignee="pm")[0]
+        reviewer = self._mk_reviewer(conn, pm, "changes-requested", "abc1234")
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": src, "verdict": "changes-requested",
+            "reviewed_sha": "abc1234", "review_round": 2, "findings": [],
+        })
+        cron.main()
+        escalation = [task for task in list_tasks(conn, assignee="pm")
+                      if "review-remediation" in (task.idempotency_key or "")][0]
+        complete_task(conn, escalation.id, result="done", summary="forgot successor")
+        conn.commit()
+        out = _capture(cron.main)
+        assert get_task(conn, escalation.id).status == "ready"
+        assert "reopened remediation PM" in out
 
     def test_blocked_verdict_no_release(self, cron, conn):
         src = self._setup(conn)
         cron.main(); pm = list_tasks(conn, assignee="pm")[0]
         self._mk_reviewer(conn, pm, "blocked", "abc1234")
         out = _capture(cron.main)
-        assert get_task(conn, src).status == "review"
+        assert get_task(conn, src).status == "blocked"
         assert "released" not in out
 
     def test_incomplete_reviewer_no_release(self, cron, conn):
@@ -406,7 +470,7 @@ class TestStaleGuard:
         meta = json.dumps({"verdict": "pass", "reviewed_sha": "abc1234", "review_round": 1})
         complete_task(conn, rev_id, result=meta, summary="pass"); conn.commit()
         out = _capture(cron.main)
-        assert get_task(conn, src).status == "review", "Stale SHA must NOT release"
+        assert get_task(conn, src).status == "blocked", "Stale SHA must NOT release"
         assert "released" not in out
 
     def test_wrong_round_no_release(self, cron, conn):
@@ -431,7 +495,68 @@ class TestStaleGuard:
         _set_sha(conn, src, "def4567"); conn.commit()
         cron.main()  # creates new PM for round 2
         assert _cron_count(conn) == 2
-        assert get_task(conn, src).status == "review"
+        assert get_task(conn, src).status == "blocked"
+
+    def test_same_sha_wrong_round_no_release(self, cron, conn):
+        src = _make_task(conn, title="same-sha", status="running", assignee="dev")
+        _set_sha(conn, src, "abc1234"); conn.commit()
+        cron.main(); pm = list_tasks(conn, assignee="pm")[0]
+        rev = _make_task(conn, title="rv", status="running", assignee="reviewer",
+                         idempotency_key=f"review:{pm.idempotency_key}")
+        conn.commit()
+        complete_task(conn, rev, result=json.dumps({
+            "verdict": "pass", "reviewed_sha": "abc1234", "review_round": 99,
+        }), summary="pass")
+        conn.commit()
+        cron.main()
+        assert get_task(conn, src).status == "blocked"
+
+
+class TestStructuredBlockedVerdict:
+    def test_does_not_escalate_historical_verdict_for_completed_source(self, cron, conn):
+        source = _make_task(conn, title="completed source", status="running", assignee="dev")
+        complete_task(conn, source, result="done", summary="done")
+        reviewer = _make_task(conn, title="old review", status="running", assignee="reviewer")
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": source, "verdict": "changes-requested",
+            "reviewed_sha": "abc1234", "review_round": 1,
+        })
+        cron.main()
+        assert list_tasks(conn, assignee="pm") == []
+
+    def test_routes_blocked_run_metadata_to_pm_without_releasing_source(self, cron, conn):
+        source = _make_task(conn, title="source", status="blocked", assignee="dev")
+        reviewer = _make_task(conn, title="independent review", status="running", assignee="reviewer")
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": source,
+            "verdict": "blocked",
+            "reviewed_sha": "abc1234",
+            "review_round": 2,
+            "findings": [{"detail": "controlled gate-off evidence missing"}],
+        })
+        cron.main(); cron.main()
+        pms = list_tasks(conn, assignee="pm", status="ready")
+        assert len(pms) == 1
+        assert pms[0].idempotency_key.endswith(f"review-remediation:{reviewer}")
+        assert "Do not create another independent review" in pms[0].body
+        assert get_task(conn, source).status == "blocked"
+
+    def test_only_latest_blocked_verdict_for_a_source_is_escalated(self, cron, conn):
+        source = _make_task(conn, title="source", status="blocked", assignee="dev")
+        old = _make_task(conn, title="old independent review", status="running", assignee="reviewer")
+        new = _make_task(conn, title="new independent review", status="running", assignee="reviewer")
+        for task_id, sha in ((old, "old1234"), (new, "new1234")):
+            _complete_structured_review(conn, task_id, {
+                "target_task_id": source, "verdict": "blocked", "reviewed_sha": sha,
+                "review_round": 2,
+            })
+        conn.execute("UPDATE tasks SET completed_at = 1 WHERE id = ?", (old,))
+        conn.execute("UPDATE tasks SET completed_at = 2 WHERE id = ?", (new,))
+        conn.commit()
+        cron.main()
+        pms = list_tasks(conn, assignee="pm", status="ready")
+        assert len(pms) == 1
+        assert pms[0].idempotency_key.endswith(f"review-remediation:{new}")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -478,7 +603,7 @@ class TestExistingReviewer:
         conn.commit()
         cron.main()
         s = get_task(conn, src)
-        assert s.status == "review"
+        assert s.status == "blocked"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -520,11 +645,11 @@ class TestE2E:
                           body="Implement X\nSHA=abc1234\n")
         _block_with_reason(conn, src, "review-required: SHA=abc1234"); conn.commit()
 
-        # Step 2-3: PM created, source → review
+        # Step 2-3: PM created while source retains its review hold.
         cron.main()
         pm = list_tasks(conn, assignee="pm", status="ready")
         assert len(pm) == 1
-        assert get_task(conn, src).status == "review"
+        assert get_task(conn, src).status == "blocked"
         assert parent_ids(conn, pm[0].id) == []
         assert "cron-review-pm" in pm[0].idempotency_key
         # _BLOCKED_REVIEW → evt<N>; SHA is metadata-only in key

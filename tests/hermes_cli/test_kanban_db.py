@@ -1903,6 +1903,24 @@ def test_respawn_guard_recent_success_bypassed_by_requeue(kanban_home):
         assert kb.check_respawn_guard(conn, t) is None
 
 
+def test_respawn_guard_recent_success_bypassed_by_resurrection(kanban_home):
+    """A cron-reopened PM task is an explicit rerun, not recent-success idle."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reopened-pm", assignee="alice")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, outcome, started_at, ended_at) "
+            "VALUES (?, 'done', 'completed', ?, ?)",
+            (t, now - 120, now - 60),
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, created_at) VALUES (?, 'resurrected', ?)",
+            (t, now - 10),
+        )
+        conn.commit()
+        assert kb.check_respawn_guard(conn, t) is None
+
+
 def test_respawn_guard_stale_success_not_guarded(kanban_home):
     """A completed run outside the guard window does not block re-spawn."""
     with kb.connect() as conn:

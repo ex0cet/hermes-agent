@@ -569,6 +569,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
             "triage to break unblock loops. Omit for a generic block."
         ),
     )
+    p_block.add_argument(
+        "--policy-json", default=None,
+        help=(
+            "Structured block policy JSON. Requires reason_code; auto-resume "
+            "is allowed only for capability/transient with retry_after and "
+            "fallback=retry."
+        ),
+    )
 
     p_schedule = sub.add_parser("schedule", help="Park one or more tasks in Scheduled (waiting on time, not human input)")
     p_schedule.add_argument("task_id")
@@ -1939,6 +1947,13 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = " ".join(args.reason).strip() if args.reason else None
     kind = getattr(args, "kind", None)
+    policy = None
+    if getattr(args, "policy_json", None):
+        try:
+            policy = json.loads(args.policy_json)
+        except json.JSONDecodeError as e:
+            print(f"invalid --policy-json: {e}", file=sys.stderr)
+            return 2
     author = _profile_author()
     ids = [args.task_id] + list(getattr(args, "ids", None) or [])
     failed: list[str] = []
@@ -1951,6 +1966,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 tid,
                 reason=reason,
                 kind=kind,
+                policy=policy,
                 expected_run_id=_worker_run_id_for(tid),
             ):
                 failed.append(tid)

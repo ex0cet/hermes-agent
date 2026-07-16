@@ -680,6 +680,7 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    policy = args.get("policy")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -717,6 +718,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                policy=policy,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1335,6 +1337,24 @@ KANBAN_BLOCK_SCHEMA = {
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
+            },
+            "policy": {
+                "type": "object",
+                "description": (
+                    "Optional machine-readable handling policy. Must include "
+                    "reason_code. Only capability/transient may set "
+                    "auto_resume=true, and then must set an epoch "
+                    "retry_after plus fallback='retry'. needs_input is always "
+                    "left for a human decision."
+                ),
+                "properties": {
+                    "reason_code": {"type": "string"},
+                    "retry_after": {"type": "integer"},
+                    "fallback": {"type": "string"},
+                    "auto_resume": {"type": "boolean"},
+                },
+                "required": ["reason_code"],
+                "additionalProperties": False,
             },
             "board": _board_schema_prop(),
         },
