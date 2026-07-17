@@ -2606,6 +2606,18 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # A worktree has no safe implicit anchor.  Deferring this validation until
+    # dispatch creates a card that looks runnable, consumes retry budget, and
+    # can be circuit-blocked before any worker starts.  Reject it at creation
+    # time instead: callers must provide an explicit repository, bind a
+    # project, or configure the board default workdir first.
+    if workspace_kind == "worktree" and workspace_path is None and project_repo is None:
+        board_slug = board if board else get_current_board()
+        raise ValueError(
+            f"worktree task requires an absolute workspace_path, a project primary repo, "
+            f"or board {board_slug!r} default_workdir"
+        )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
