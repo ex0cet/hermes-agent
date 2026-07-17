@@ -490,6 +490,29 @@ class TestReviewRelease:
 
 
 class TestStaleGuard:
+    def test_direct_pm_reviewer_pass_releases_its_metadata_target(self, cron, conn):
+        src = _make_task(conn, title="direct target", status="running", assignee="dev")
+        _set_sha(conn, src, "abc1234"); conn.commit()
+        reviewer = _make_task(conn, title="direct reviewer", status="running", assignee="rv",
+                              idempotency_key=f"review:{src}:abc1234:3")
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": src, "verdict": "pass", "reviewed_sha": "abc1234",
+            "review_round": 3,
+        })
+        cron.main()
+        assert get_task(conn, src).status == "ready"
+
+    def test_completed_pm_metadata_round_overrides_creation_prompt(self, cron, conn):
+        src = _make_task(conn, title="post-remediation", status="running", assignee="dev")
+        _set_sha(conn, src, "abc1234"); conn.commit()
+        cron.main()
+        pm = list_tasks(conn, assignee="pm")[0]
+        # The PM body was created as round 1 but its reconciliation completed
+        # a pre-existing round-3 reviewer.
+        assert kb.claim_task(conn, pm.id) is not None
+        kb.complete_task(conn, pm.id, metadata={"review_round": 3})
+        assert cron._expected_review_round(conn, pm.idempotency_key) == 3
+
     def test_latest_review_block_sha_wins_over_old_handoff(self, cron, conn):
         src = _make_task(conn, title="multiple handoffs", status="running", assignee="dev")
         _set_sha(conn, src, "aaaaaaa")
