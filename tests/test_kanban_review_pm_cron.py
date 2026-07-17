@@ -100,6 +100,58 @@ def test_running_old_sha_reviewer_is_not_quarantined(cron, conn):
     assert get_task(conn, old).status == "running"
 
 
+def test_accepted_gate_decision_quarantines_only_named_nonrunning_artifacts(cron, conn):
+    """Gate cleanup is opt-in structured data, never title-based guessing."""
+    obsolete = _make_task(conn, title="old remediation", status="blocked")
+    running = _make_task(conn, title="still collecting evidence", status="running")
+    gate_reviewer = _make_task(conn, title="Gate B review", status="running", assignee="reviewer")
+    review = {"target_task_id": "gate-source", "verdict": "pass", "reviewed_sha": "c" * 40,
+              "review_round": 1}
+    complete_task(
+        conn, gate_reviewer, summary="Gate accepted",
+        metadata={"review": review, "gate_decision": {
+            "accepted": True, "workflow": "pre-86-10", "stage": "B",
+            "obsolete_task_ids": [obsolete, running],
+        }},
+    )
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, 'done', 1, 1, 'completed', ?)",
+        (gate_reviewer, json.dumps({"review": review, "gate_decision": {
+            "accepted": True, "workflow": "pre-86-10", "stage": "B",
+            "obsolete_task_ids": [obsolete, running],
+        }})),
+    )
+    conn.commit()
+
+    assert cron._quarantine_gate_superseded_artifacts(conn) == 1
+    assert get_task(conn, obsolete).status == "archived"
+    assert get_task(conn, running).status == "running"
+    event = [e for e in kb.list_events(conn, obsolete)
+             if e.kind == "quarantined_by_gate_acceptance"][-1]
+    assert event.payload["stage"] == "B"
+
+
+def test_gate_decision_without_explicit_obsolete_ids_does_not_archive(conn, cron):
+    candidate = _make_task(conn, title="blocked but unrelated", status="blocked")
+    reviewer = _make_task(conn, title="Gate review", status="running", assignee="reviewer")
+    review = {"target_task_id": "gate-source", "verdict": "pass", "reviewed_sha": "d" * 40,
+              "review_round": 1}
+    complete_task(conn, reviewer, summary="Gate accepted", metadata={
+        "review": review,
+        "gate_decision": {"accepted": True, "workflow": "pre-86-10", "stage": "B"},
+    })
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, 'done', 1, 1, 'completed', ?)",
+        (reviewer, json.dumps({"review": review, "gate_decision": {
+            "accepted": True, "workflow": "pre-86-10", "stage": "B"}})),
+    )
+    conn.commit()
+    assert cron._quarantine_gate_superseded_artifacts(conn) == 0
+    assert get_task(conn, candidate).status == "blocked"
+
+
 def test_accepted_remediation_successor_completes_blocked_source(cron, conn):
     source = _make_task(conn, title="source", status="blocked")
     gate = _make_task(conn, title="Gate", status="todo", assignee="reviewer", parents=(source,))
