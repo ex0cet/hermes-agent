@@ -425,6 +425,33 @@ class TestReviewRelease:
         assert escalations[0].status == "ready"
         assert "remediation PM escalation" in out
 
+    def test_first_round_changes_requested_on_pm_successor_routes_back_to_pm(self, cron, conn):
+        """A bounded PM successor never gets an implicit extra rework round."""
+        src = self._setup(conn)
+        cron.main()
+        pm = list_tasks(conn, assignee="pm")[0]
+        handoff_owner = _make_task(conn, title="completed PM", status="done", assignee="pm")
+        kb._append_event(conn, handoff_owner, "remediation_handoff_applied", {
+            "source_task_id": "original-source",
+            "successor_task_id": src,
+            "retired_predecessor_task_ids": [],
+        })
+        conn.commit()
+        reviewer = self._mk_reviewer(conn, pm, "changes-requested", "abc1234")
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": src,
+            "verdict": "changes-requested",
+            "reviewed_sha": "abc1234",
+            "review_round": 1,
+            "findings": [{"detail": "PM decision required"}],
+        })
+        out = _capture(cron.main)
+        assert get_task(conn, src).status == "blocked"
+        escalations = [task for task in list_tasks(conn, assignee="pm")
+                       if "review-remediation" in (task.idempotency_key or "")]
+        assert len(escalations) == 1
+        assert "remediation PM escalation" in out
+
     def test_completed_remediation_pm_without_successor_reopens(self, cron, conn):
         src = self._setup(conn)
         cron.main(); pm = list_tasks(conn, assignee="pm")[0]
