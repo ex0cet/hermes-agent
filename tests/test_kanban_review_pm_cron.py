@@ -452,6 +452,32 @@ class TestReviewRelease:
         assert len(escalations) == 1
         assert "remediation PM escalation" in out
 
+    def test_pm_successor_escalation_suppresses_duplicate_ordinary_review_pm(self, cron, conn):
+        """One reviewed PM successor produces one PM decision card, never two."""
+        src = self._setup(conn)
+        handoff_owner = _make_task(conn, title="completed PM", status="done", assignee="pm")
+        kb._append_event(conn, handoff_owner, "remediation_handoff_applied", {
+            "source_task_id": "original-source",
+            "successor_task_id": src,
+            "retired_predecessor_task_ids": [],
+        })
+        reviewer = _make_task(
+            conn, title="direct reviewer", status="running", assignee="reviewer",
+            idempotency_key="review:direct-pm-successor",
+        )
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": src,
+            "verdict": "changes-requested",
+            "reviewed_sha": "abc1234",
+            "review_round": 1,
+            "findings": [{"detail": "PM decision required"}],
+        })
+        conn.commit()
+        _capture(cron.main)
+        pm_tasks = [task for task in list_tasks(conn, assignee="pm") if task.status != "done"]
+        assert len(pm_tasks) == 1
+        assert "review-remediation" in (pm_tasks[0].idempotency_key or "")
+
     def test_completed_remediation_pm_without_successor_reopens(self, cron, conn):
         src = self._setup(conn)
         cron.main(); pm = list_tasks(conn, assignee="pm")[0]
