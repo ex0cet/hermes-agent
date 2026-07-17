@@ -122,6 +122,38 @@ def test_accepted_remediation_successor_completes_blocked_source(cron, conn):
     assert any(e.kind == "remediation_successor_accepted" for e in kb.list_events(conn, source))
 
 
+def test_accepted_nested_remediation_propagates_to_original_source(cron, conn):
+    """A reviewed leaf closes every blocked ancestor in one reconciliation."""
+    source = _make_task(conn, title="original", status="blocked")
+    gate = _make_task(conn, title="Gate", status="todo", assignee="reviewer", parents=(source,))
+    intermediate = _make_task(conn, title="first remediation", status="blocked")
+    leaf = _make_task(conn, title="final remediation", status="running")
+    pm_one = _make_task(conn, title="PM one", status="done", assignee="pm")
+    pm_two = _make_task(conn, title="PM two", status="done", assignee="pm")
+    kb.complete_task(conn, leaf, summary="leaf remediation complete")
+    reviewer = _make_task(conn, title="leaf review", status="running", assignee="reviewer")
+    _complete_structured_review(conn, reviewer, {
+        "target_task_id": leaf, "verdict": "pass", "reviewed_sha": "b" * 40,
+        "review_round": 1,
+    })
+    with kb.write_txn(conn):
+        kb._append_event(conn, source, "remediation_handoff_applied", {
+            "pm_task_id": pm_one, "successor_task_id": intermediate,
+            "retired_predecessor_task_ids": [],
+        })
+        kb._append_event(conn, intermediate, "remediation_handoff_applied", {
+            "pm_task_id": pm_two, "successor_task_id": leaf,
+            "retired_predecessor_task_ids": [],
+        })
+    assert cron._reconcile_completed_remediation_liveness(conn) == 2
+    assert get_task(conn, intermediate).status == "done"
+    assert get_task(conn, source).status == "done"
+    assert get_task(conn, gate).status == "ready"
+    source_events = kb.list_events(conn, source)
+    assert source_events[-1].kind == "remediation_successor_accepted"
+    assert source_events[-1].payload["acceptance"] == "accepted_descendant"
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
