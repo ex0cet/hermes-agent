@@ -26,9 +26,12 @@ from hermes_cli.kanban_db import (
 
 def _make_task(conn, *, title="test", status="ready", assignee="dev",
                body=None, idempotency_key=None, task_kind=None,
-               parents=()) -> str:
+               parents=(), workspace_kind="scratch", workspace_path=None,
+               branch_name=None) -> str:
     tid = create_task(conn, title=title, body=body, assignee=assignee,
-                       idempotency_key=idempotency_key, parents=parents)
+                       idempotency_key=idempotency_key, parents=parents,
+                       workspace_kind=workspace_kind, workspace_path=workspace_path,
+                       branch_name=branch_name)
     if status != "ready":
         with write_txn(conn):
             conn.execute("UPDATE tasks SET status = ? WHERE id = ?", (status, tid))
@@ -98,6 +101,30 @@ def test_running_old_sha_reviewer_is_not_quarantined(cron, conn):
     )
     assert cron._quarantine_stale_review_artifacts(conn) == 0
     assert get_task(conn, old).status == "running"
+
+
+def test_misanchored_reviewer_is_replaced_and_rebound_to_target_workspace(cron, conn):
+    source = _make_task(
+        conn, title="source", status="blocked", workspace_kind="worktree",
+        workspace_path="/repo/.worktrees/source", branch_name="wt/source",
+    )
+    reviewer = _make_task(
+        conn, title="review", status="blocked", assignee="reviewer",
+        body=f"- review_target_task_id: {source}",
+        workspace_kind="scratch", workspace_path="/scratch/review",
+    )
+    _block_with_reason(conn, source, f"review-required: reviewer task {reviewer}")
+    assert cron._repair_misanchored_review_workspaces(conn) == 1
+    assert get_task(conn, reviewer).status == "archived"
+    replacement = conn.execute(
+        "SELECT id FROM tasks WHERE idempotency_key = ?",
+        (f"workspace-repair:{reviewer}:{source}",),
+    ).fetchone()["id"]
+    repaired = get_task(conn, replacement)
+    assert repaired.workspace_path == "/repo/.worktrees/source"
+    assert repaired.branch_name == "wt/source"
+    latest = [e for e in kb.list_events(conn, source) if e.kind == "blocked"][-1]
+    assert replacement in latest.payload["reason"]
 
 
 def test_accepted_gate_decision_quarantines_only_named_nonrunning_artifacts(cron, conn):
