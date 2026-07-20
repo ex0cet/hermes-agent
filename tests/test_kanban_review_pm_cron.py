@@ -588,6 +588,32 @@ class TestReviewRelease:
         assert escalations[0].status == "ready"
         assert "remediation PM escalation" in out
 
+    def test_final_changes_requested_requires_explicit_pm_decision(self, cron, conn):
+        """A failed final acceptance review is never silently retried."""
+        src = self._setup(conn)
+        reviewer = _make_task(
+            conn, title="final reviewer", status="running", assignee="reviewer",
+            task_kind="independent_review",
+            idempotency_key=f"review-final:{src}:abc1234:3",
+        )
+        _complete_structured_review(conn, reviewer, {
+            "target_task_id": src,
+            "verdict": "changes-requested",
+            "reviewed_sha": "abc1234",
+            "review_round": 3,
+            "findings": [{"detail": "final bounded finding"}],
+        })
+
+        out = _capture(cron.main)
+
+        assert get_task(conn, src).status == "blocked"
+        escalations = [task for task in list_tasks(conn, assignee="pm")
+                       if "review-remediation" in (task.idempotency_key or "")]
+        assert len(escalations) == 1
+        assert "Final acceptance decision required" in (escalations[0].body or "")
+        assert "Choose exactly one" in (escalations[0].body or "")
+        assert "remediation PM escalation" in out
+
     def test_first_round_changes_requested_on_pm_successor_routes_back_to_pm(self, cron, conn):
         """A bounded PM successor never gets an implicit extra rework round."""
         src = self._setup(conn)
