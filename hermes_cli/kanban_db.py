@@ -9597,6 +9597,8 @@ class PmRoutingDecision:
     resume_action: Optional[str] = None
     review_round_action: Optional[str] = None
     target_sha: Optional[str] = None
+    retry_review_title: Optional[str] = None
+    retry_review_body: Optional[str] = None
     replacement_title: Optional[str] = None
     replacement_body: Optional[str] = None
     clarification_title: Optional[str] = None
@@ -9614,7 +9616,10 @@ def parse_pm_routing_decision(metadata, source_task_id, resolution_key):
     return PmRoutingDecision(decision=str(metadata["decision"]),
         source_task_id=str(metadata.get("source_task_id", source_task_id)), resolution_key=resolution_key,
         resume_action=metadata.get("resume_action"), review_round_action=metadata.get("review_round_action"),
-        target_sha=metadata.get("target_sha"), replacement_title=metadata.get("replacement_title"),
+        target_sha=metadata.get("target_sha"),
+        retry_review_title=metadata.get("retry_review_title"),
+        retry_review_body=metadata.get("retry_review_body"),
+        replacement_title=metadata.get("replacement_title"),
         replacement_body=metadata.get("replacement_body"), clarification_title=metadata.get("clarification_title"),
         clarification_body=metadata.get("clarification_body"), contract_fix_title=metadata.get("contract_fix_title"),
         contract_fix_body=metadata.get("contract_fix_body"), supersede_reason=metadata.get("supersede_reason"),
@@ -9675,8 +9680,82 @@ def apply_pm_routing_decision(conn, decision, *, board=None):
         _append_event(conn, decision.source_task_id, "parent_added", {"parent_id": new_id, "kind": nk})
         result["new_task_id"] = new_id; result["status"] = "dependency_added"
     elif decision.decision == PM_ROUTING_RETRY_REVIEW:
-        _append_event(conn, decision.source_task_id, "review_retry_requested", {"target_sha": decision.target_sha or ""})
-        result["target_sha"] = decision.target_sha or ""; result["status"] = "retry_pending"
+        # ``retry_review`` used to record only an advisory event.  Nothing
+        # consumed that event, leaving the source on its sticky review hold
+        # with no runnable reviewer.  Materialise the one bounded retry here
+        # instead.  The review remains independent: it has no source parent;
+        # the source waits solely on the explicit review-required handoff.
+        source = get_task(conn, decision.source_task_id)
+        if source is None or source.status == "archived":
+            result["status"] = "source_missing"
+        else:
+            target_sha = (decision.target_sha or "").strip()
+            review_key = f"review-retry:{decision.resolution_key}:{target_sha or 'current'}"
+            retry_title = decision.retry_review_title or (
+                f"Final bounded review — {source.title}"
+            )
+            retry_body = decision.retry_review_body or "\n".join([
+                "## PM-authorized bounded final review",
+                "",
+                f"**Review target:** {source.id}",
+                f"**Target SHA:** {target_sha or '(current workspace HEAD; verify and report)'}",
+                "",
+                "This is the single retry explicitly selected by PM after a "
+                "bounded remediation. Review only the remediation evidence and "
+                "the original acceptance criteria; do not start another automatic "
+                "review loop. Complete with structured `metadata.review` using "
+                "the target task id and a `pass`, `pass-with-nits`, "
+                "`changes-requested`, or `blocked` verdict.",
+            ])
+            reviewer_id = create_task(
+                conn,
+                title=retry_title,
+                body=retry_body,
+                assignee="reviewer",
+                created_by="pm-routing",
+                workspace_kind=source.workspace_kind,
+                workspace_path=source.workspace_path,
+                branch_name=source.branch_name,
+                tenant=source.tenant,
+                priority=source.priority,
+                idempotency_key=review_key,
+                max_retries=3,
+                project_id=source.project_id,
+            )
+            # The verdict bridge binds to the *latest* blocked event.  Replace
+            # the old reviewer reference atomically with the retry handoff so
+            # a passing retry can release exactly this source and no other.
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', block_kind=NULL WHERE id=? "
+                    "AND status!='archived'",
+                    (decision.source_task_id,),
+                )
+                _append_event(
+                    conn,
+                    decision.source_task_id,
+                    "blocked",
+                    {
+                        "reason": f"review-required: reviewer task {reviewer_id}",
+                        "kind": "review_retry",
+                        "reviewer_id": reviewer_id,
+                        "target_sha": target_sha or None,
+                        "resolution_key": decision.resolution_key,
+                    },
+                )
+                _append_event(
+                    conn,
+                    decision.source_task_id,
+                    "review_retry_requested",
+                    {
+                        "target_sha": target_sha,
+                        "reviewer_id": reviewer_id,
+                        "resolution_key": decision.resolution_key,
+                    },
+                )
+            result["target_sha"] = target_sha
+            result["reviewer_task_id"] = reviewer_id
+            result["status"] = "review_dispatched"
     elif decision.decision == PM_ROUTING_HUMAN_REVIEW:
         conn.execute("UPDATE tasks SET status='blocked', block_kind='needs_input' WHERE id=? AND status IN ('todo','ready')",
                      (decision.source_task_id,))

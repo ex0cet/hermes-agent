@@ -736,7 +736,7 @@ class TestPmRouting:
         assert repl_t.task_kind == "replacement"
 
     def test_retry_review(self, conn):
-        """23. RetryReviewでPM指定SHAの新review taskを作る"""
+        """23. RetryReview creates one independent reviewer and rebinds the hold."""
         src = _make_task(conn, title="F")
         claim_task(conn, src)
         run_id = get_task(conn, src).current_run_id
@@ -763,8 +763,18 @@ class TestPmRouting:
             "review-loop:t:retry:AC-13",
         )
         result = kb.apply_pm_routing_decision(conn, decision)
-        assert result["status"] == "retry_pending"
+        assert result["status"] == "review_dispatched"
         assert result["target_sha"] == "newsha1234"
+        reviewer = kb.get_task(conn, result["reviewer_task_id"])
+        assert reviewer is not None
+        assert reviewer.assignee == "reviewer"
+        assert reviewer.status == "ready"
+        assert src not in kb.parent_ids(conn, reviewer.id)
+        latest_block = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+            "ORDER BY id DESC LIMIT 1", (src,)
+        ).fetchone()
+        assert result["reviewer_task_id"] in latest_block["payload"]
 
     def test_human_review_required(self, conn):
         """24. HumanReviewRequiredでは自動再開しない"""
