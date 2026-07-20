@@ -168,6 +168,31 @@ def test_round_two_remediation_dispatches_one_final_reviewer_and_rebinds_source(
     assert cron._dispatch_final_reviews_after_bounded_remediation(conn) == 0
 
 
+def test_final_review_is_not_repeated_after_a_round_three_non_pass(cron, conn):
+    source = _make_task(conn, title="source", status="blocked")
+    _block_with_reason(conn, source, "review-required: reviewer task t_old; SHA: aaaaaaa")
+    with write_txn(conn):
+        kb._append_event(conn, source, "review_verdict_requires_routing", {
+            "review_round": 3, "reviewer_id": "t_old",
+        })
+    remediation = _make_task(conn, title="later remediation", status="running", assignee="dev")
+    metadata = {
+        "new_sha": "c" * 40,
+        "review": {"target_task_id": source,
+                   "verdict": "remediation-ready-for-final-acceptance"},
+    }
+    complete_task(conn, remediation, metadata=metadata)
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, 'done', 1, 1, 'completed', ?)",
+        (remediation, json.dumps(metadata)),
+    )
+    conn.commit()
+
+    assert cron._dispatch_final_reviews_after_bounded_remediation(conn) == 0
+    assert conn.execute("SELECT count(*) FROM tasks WHERE assignee = 'reviewer'").fetchone()[0] == 0
+
+
 def test_accepted_gate_decision_quarantines_only_named_nonrunning_artifacts(cron, conn):
     """Gate cleanup is opt-in structured data, never title-based guessing."""
     obsolete = _make_task(conn, title="old remediation", status="blocked")
@@ -272,6 +297,24 @@ def test_accepted_nested_remediation_propagates_to_original_source(cron, conn):
     source_events = kb.list_events(conn, source)
     assert source_events[-1].kind == "remediation_successor_accepted"
     assert source_events[-1].payload["acceptance"] == "accepted_descendant"
+
+
+def test_completed_unaccepted_successor_reopens_pm_while_source_is_blocked(cron, conn):
+    """A completed successor cannot leave a blocked source behind forever."""
+    source = _make_task(conn, title="source", status="blocked")
+    successor = _make_task(conn, title="unaccepted successor", status="running")
+    pm = _make_task(conn, title="PM", status="done", assignee="pm")
+    kb.complete_task(conn, successor, summary="implementation complete, no acceptance evidence")
+    with kb.write_txn(conn):
+        kb._append_event(conn, source, "remediation_handoff_applied", {
+            "pm_task_id": pm, "successor_task_id": successor,
+            "retired_predecessor_task_ids": [],
+        })
+
+    assert cron._reconcile_completed_remediation_liveness(conn) == 1
+    assert get_task(conn, pm).status == "ready"
+    assert any("liveness invariant failed" in (comment.body or "")
+               for comment in kb.list_comments(conn, source))
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
