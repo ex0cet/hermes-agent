@@ -317,6 +317,28 @@ def test_completed_unaccepted_successor_reopens_pm_while_source_is_blocked(cron,
                for comment in kb.list_comments(conn, source))
 
 
+def test_liveness_does_not_reopen_historical_pm_when_newer_pm_is_active(cron, conn):
+    source = _make_task(conn, title="source", status="blocked")
+    successor = _make_task(conn, title="unaccepted successor", status="running")
+    old_pm = _make_task(
+        conn, title="old PM", status="done", assignee="pm",
+        idempotency_key=f"cron-review-pm:{source}:review-remediation:t_old",
+    )
+    _make_task(
+        conn, title="new PM", status="ready", assignee="pm",
+        idempotency_key=f"cron-review-pm:{source}:review-remediation:t_new",
+    )
+    kb.complete_task(conn, successor, summary="implementation complete, no acceptance evidence")
+    with kb.write_txn(conn):
+        kb._append_event(conn, source, "remediation_handoff_applied", {
+            "pm_task_id": old_pm, "successor_task_id": successor,
+            "retired_predecessor_task_ids": [],
+        })
+
+    assert cron._reconcile_completed_remediation_liveness(conn) == 0
+    assert get_task(conn, old_pm).status == "done"
+
+
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
