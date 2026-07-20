@@ -125,6 +125,12 @@ def test_misanchored_reviewer_is_replaced_and_rebound_to_target_workspace(cron, 
     assert repaired.branch_name == "wt/source"
     latest = [e for e in kb.list_events(conn, source) if e.kind == "blocked"][-1]
     assert replacement in latest.payload["reason"]
+    _complete_structured_review(conn, replacement, {
+        "target_task_id": source, "verdict": "pass", "reviewed_sha": "",
+        "review_round": 3,
+    })
+    cron.main()
+    assert get_task(conn, source).status == "ready"
 
 
 def test_accepted_gate_decision_quarantines_only_named_nonrunning_artifacts(cron, conn):
