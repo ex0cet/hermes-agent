@@ -253,6 +253,17 @@ class TestDetection:
         cron.main()
         assert _cron_count(conn) == 1
 
+    def test_named_live_reviewer_suppresses_redundant_pm_orchestration(self, cron, conn):
+        """A normal worker-created review handoff is not a cron recovery case."""
+        src = _make_task(conn, title="B", status="running", assignee="dev")
+        reviewer = _make_task(conn, title="Independent review", assignee="reviewer")
+        _block_with_reason(conn, src, f"review-required: reviewer task {reviewer}")
+        conn.commit()
+
+        assert cron._find_review_candidates(conn) == []
+        cron.main()
+        assert _cron_count(conn) == 0
+
     def test_ignores_plain_blocked(self, cron, conn):
         src = _make_task(conn, title="P", status="running", assignee="dev")
         _block_with_reason(conn, src, "dependency: waiting")
