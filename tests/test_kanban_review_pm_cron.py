@@ -133,6 +133,41 @@ def test_misanchored_reviewer_is_replaced_and_rebound_to_target_workspace(cron, 
     assert get_task(conn, source).status == "ready"
 
 
+def test_round_two_remediation_dispatches_one_final_reviewer_and_rebinds_source(cron, conn):
+    source = _make_task(
+        conn, title="source", status="blocked", workspace_kind="worktree",
+        workspace_path="/repo/.worktrees/source", branch_name="wt/source",
+    )
+    _block_with_reason(conn, source, "review-required: reviewer task t_old; SHA: aaaaaaa")
+    with write_txn(conn):
+        kb._append_event(conn, source, "review_verdict_requires_routing", {
+            "review_round": 2, "reviewer_id": "t_old",
+        })
+    remediation = _make_task(conn, title="bounded remediation", status="running", assignee="dev")
+    kb.link_tasks(conn, remediation, source)
+    metadata = {
+        "new_sha": "b" * 40,
+        "review": {"target_task_id": source,
+                   "verdict": "remediation-ready-for-final-acceptance"},
+    }
+    complete_task(conn, remediation, metadata=metadata)
+    conn.execute(
+        "INSERT INTO task_runs (task_id, status, started_at, ended_at, outcome, metadata) "
+        "VALUES (?, 'done', 1, 1, 'completed', ?)",
+        (remediation, json.dumps(metadata)),
+    )
+    conn.commit()
+    assert cron._dispatch_final_reviews_after_bounded_remediation(conn) == 1
+    final = conn.execute(
+        "SELECT id, workspace_path FROM tasks WHERE idempotency_key = ?",
+        (f"review-final:{source}:{'b' * 40}:3",),
+    ).fetchone()
+    assert final["workspace_path"] == "/repo/.worktrees/source"
+    latest = [e for e in kb.list_events(conn, source) if e.kind == "blocked"][-1]
+    assert final["id"] in latest.payload["reason"]
+    assert cron._dispatch_final_reviews_after_bounded_remediation(conn) == 0
+
+
 def test_accepted_gate_decision_quarantines_only_named_nonrunning_artifacts(cron, conn):
     """Gate cleanup is opt-in structured data, never title-based guessing."""
     obsolete = _make_task(conn, title="old remediation", status="blocked")
